@@ -46,15 +46,94 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   final ImagePicker _picker = ImagePicker();
   final TextRecognizer _textRecognizer = TextRecognizer();
+  final TextEditingController _titleController = TextEditingController();
 
   String _recognizedText = '';
   bool _isProcessing = false;
   XFile? _imageFile;
+  String? _detectedTitle;
+  double? _matchPercent;
+  bool? _isTitleMatch;
 
   @override
   void dispose() {
+    _titleController.dispose();
     _textRecognizer.close();
     super.dispose();
+  }
+
+  String? _extractTitle(String text) {
+    final lines = text.split('\n');
+    final regex = RegExp(
+      r'title\s*:\s*(.+)',
+      caseSensitive: false,
+    );
+    for (final line in lines) {
+      final match = regex.firstMatch(line);
+      if (match != null) {
+        return match.group(1)?.trim();
+      }
+    }
+    return null;
+  }
+
+  void _updateMatch() {
+    final expected = _titleController.text.trim();
+    final detected = _detectedTitle?.trim() ?? '';
+
+    if (expected.isEmpty || detected.isEmpty) {
+      setState(() {
+        _matchPercent = null;
+        _isTitleMatch = null;
+      });
+      return;
+    }
+
+    final similarity =
+        _calculateSimilarity(expected.toLowerCase(), detected.toLowerCase());
+
+    setState(() {
+      _matchPercent = similarity * 100;
+      _isTitleMatch = similarity >= 0.8;
+    });
+  }
+
+  double _calculateSimilarity(String a, String b) {
+    if (a.isEmpty && b.isEmpty) {
+      return 1.0;
+    }
+    if (a.isEmpty || b.isEmpty) {
+      return 0.0;
+    }
+
+    final m = a.length;
+    final n = b.length;
+    final dp = List.generate(
+      m + 1,
+      (_) => List<int>.filled(n + 1, 0),
+    );
+
+    for (var i = 0; i <= m; i++) {
+      dp[i][0] = i;
+    }
+    for (var j = 0; j <= n; j++) {
+      dp[0][j] = j;
+    }
+
+    for (var i = 1; i <= m; i++) {
+      for (var j = 1; j <= n; j++) {
+        final cost = a[i - 1] == b[j - 1] ? 0 : 1;
+        dp[i][j] = [
+          dp[i - 1][j] + 1,
+          dp[i][j - 1] + 1,
+          dp[i - 1][j - 1] + cost,
+        ].reduce((value, element) => value < element ? value : element);
+      }
+    }
+
+    final distance = dp[m][n];
+    final maxLen = m > n ? m : n;
+    return 1.0 - distance / maxLen;
   }
 
   Future<void> _scanDocument() async {
@@ -80,8 +159,10 @@ class _MyHomePageState extends State<MyHomePage> {
 
       setState(() {
         _recognizedText = recognizedText.text;
+        _detectedTitle = _extractTitle(recognizedText.text);
         _isProcessing = false;
       });
+      _updateMatch();
     } catch (e) {
       setState(() {
         _isProcessing = false;
@@ -114,6 +195,42 @@ class _MyHomePageState extends State<MyHomePage> {
                 child: Image.file(File(_imageFile!.path)),
               ),
             ],
+            const SizedBox(height: 16),
+            TextField(
+              controller: _titleController,
+              decoration: const InputDecoration(
+                labelText: 'Enter expected title',
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (_) => _updateMatch(),
+            ),
+            const SizedBox(height: 12),
+            if (_detectedTitle != null)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Detected title: $_detectedTitle',
+                  style: const TextStyle(fontWeight: FontWeight.w500),
+                ),
+              )
+            else if (_recognizedText.isNotEmpty)
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text('No "Title:" section found in image.'),
+              ),
+            const SizedBox(height: 8),
+            if (_matchPercent != null && _isTitleMatch != null)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Match: ${_isTitleMatch! ? 'True' : 'False'} '
+                  '(${_matchPercent!.toStringAsFixed(1)}%)',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: _isTitleMatch! ? Colors.green : Colors.red,
+                  ),
+                ),
+              ),
             const SizedBox(height: 16),
             Expanded(
               child: SingleChildScrollView(
