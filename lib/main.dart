@@ -39,7 +39,9 @@ class _CropDocumentScreen extends StatefulWidget {
 
 class _CropDocumentScreenState extends State<_CropDocumentScreen> {
   List<Offset>? _corners;
+  List<Offset>? _autoCorners01; // normalized (0..1) topLeft, topRight, bottomRight, bottomLeft
   Size? _viewSize;
+  bool _hasUserAdjustedCorners = false;
 
   static const double _handleSize = 20;
   static const double _minEdge = 30;
@@ -47,11 +49,419 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
   /// Order: topLeft, topRight, bottomRight, bottomLeft
   void _initCorners(double width, double height) {
     final margin = 0.1;
-    _corners ??= [
+    if (_corners != null) return;
+
+    // Prefer auto-detected corners if available; otherwise fall back.
+    if (_autoCorners01 != null && _autoCorners01!.length == 4) {
+      _corners = _autoCorners01!
+          .map((p) => Offset(p.dx * width, p.dy * height))
+          .toList(growable: false);
+      return;
+    }
+
+    _corners = [
       Offset(width * margin, height * margin),
       Offset(width * (1 - margin), height * margin),
       Offset(width * (1 - margin), height * (1 - margin)),
       Offset(width * margin, height * (1 - margin)),
+    ];
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _detectAutoCorners();
+  }
+
+  Future<void> _detectAutoCorners() async {
+    try {
+      final bytes = await File(widget.imagePath).readAsBytes();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) return;
+
+      final inputImage = InputImage.fromFilePath(widget.imagePath);
+      final recognizer = TextRecognizer();
+      final result = await recognizer.processImage(inputImage);
+      recognizer.close();
+
+      // 1) Try OCR-based rectangle.
+      final ocrAuto01 = _detectAutoCornersFromText(result, decoded.width, decoded.height);
+      // 2) If OCR is weak, try an edge-based rectangle.
+      final auto01 = ocrAuto01 ?? _detectAutoCornersFromEdges(decoded);
+      if (auto01 == null) return;
+
+      if (!mounted) return;
+      setState(() {
+        _autoCorners01 = auto01;
+        // Apply automatically unless user has already moved corners manually.
+        if (!_hasUserAdjustedCorners && _viewSize != null) {
+          _corners = auto01
+              .map((p) => Offset(p.dx * _viewSize!.width, p.dy * _viewSize!.height))
+              .toList(growable: false);
+        }
+      });
+    } catch (_) {
+      // Ignore: fall back to default corners.
+    }
+  }
+
+  List<Offset>? _detectAutoCornersFromText(
+    RecognizedText result,
+    int width,
+    int height,
+  ) {
+    // Too little OCR text means low confidence for automatic document box.
+    if (result.blocks.length < 3) return null;
+
+    double? minX, minY, maxX, maxY;
+    for (final block in result.blocks) {
+      final pts = block.cornerPoints;
+      if (pts == null || pts.isEmpty) continue;
+      for (final p in pts) {
+        final x = p.x.toDouble();
+        final y = p.y.toDouble();
+        minX = minX == null ? x : math.min(minX!, x);
+        minY = minY == null ? y : math.min(minY!, y);
+        maxX = maxX == null ? x : math.max(maxX!, x);
+        maxY = maxY == null ? y : math.max(maxY!, y);
+      }
+    }
+
+    if (minX == null ||
+        minY == null ||
+        maxX == null ||
+        maxY == null ||
+        maxX <= minX ||
+        maxY <= minY) {
+      return null;
+    }
+
+    // Smaller padding — tight around text keeps corners closer to the card.
+    final padX = (maxX! - minX!) * 0.06;
+    final padY = (maxY! - minY!) * 0.10;
+
+    final left = (minX! - padX).clamp(0.0, width.toDouble());
+    final top = (minY! - padY).clamp(0.0, height.toDouble());
+    final right = (maxX! + padX).clamp(0.0, width.toDouble());
+    final bottom = (maxY! + padY).clamp(0.0, height.toDouble());
+
+    return _buildValidatedAutoRect(left, top, right, bottom, width.toDouble(), height.toDouble());
+  }
+
+  List<Offset>? _detectAutoCornersFromEdges(img.Image decoded) {
+    const targetW = 640;
+    final resized = decoded.width > targetW
+        ? img.copyResize(decoded, width: targetW)
+        : decoded;
+
+    final gray = img.grayscale(resized);
+    final w = gray.width;
+    final h = gray.height;
+    if (w < 20 || h < 20) return null;
+
+    // Prefer "bright island" (ID) on darker / busy fabric backgrounds.
+    final lumBox = _coarseBoxFromLuminance(gray);
+    // Fallback: stricter gradient hull than before (less background bleed).
+    final edgeBox = lumBox ?? _coarseBoxFromEdgeHull(gray);
+
+    if (edgeBox == null) return null;
+
+    var left = edgeBox.$1;
+    var top = edgeBox.$2;
+    var right = edgeBox.$3;
+    var bottom = edgeBox.$4;
+
+    if (right <= left || bottom <= top) return null;
+
+    // Snap each side to a strong local edge inside a small search band.
+    final refined = _refineBoxByLocalEdges(gray, left, top, right, bottom);
+    left = refined.$1;
+    top = refined.$2;
+    right = refined.$3;
+    bottom = refined.$4;
+
+    if (right <= left || bottom <= top) return null;
+
+    final scaleX = decoded.width / w;
+    final scaleY = decoded.height / h;
+    final l = (left * scaleX);
+    final t = (top * scaleY);
+    final r = (right * scaleX);
+    final b = (bottom * scaleY);
+
+    return _buildValidatedAutoRect(
+      l,
+      t,
+      r,
+      b,
+      decoded.width.toDouble(),
+      decoded.height.toDouble(),
+    );
+  }
+
+  /// Bounding box of mostly-bright rows/columns (typical ID on patterned surface).
+  (int, int, int, int)? _coarseBoxFromLuminance(img.Image gray) {
+    final w = gray.width;
+    final h = gray.height;
+    final xMin = (w * 0.06).toInt();
+    final xMax = (w * 0.94).toInt();
+    final yMin = (h * 0.06).toInt();
+    final yMax = (h * 0.94).toInt();
+    if (xMax <= xMin || yMax <= yMin) return null;
+
+    var sum = 0.0;
+    var sum2 = 0.0;
+    var n = 0;
+    for (var y = yMin; y < yMax; y++) {
+      for (var x = xMin; x < xMax; x++) {
+        final v = gray.getPixel(x, y).r.toDouble();
+        sum += v;
+        sum2 += v * v;
+        n++;
+      }
+    }
+    if (n == 0) return null;
+    final mean = sum / n;
+    final var_ = (sum2 / n - mean * mean).clamp(0.0, 1e9);
+    final std = math.sqrt(var_);
+    final thr = mean + 0.22 * std;
+    if (thr > 250) return null;
+
+    final rowBrightFrac = List<double>.filled(h, 0);
+    final colBrightFrac = List<double>.filled(w, 0);
+
+    final rowDen = (xMax - xMin).toDouble();
+    final colDen = (yMax - yMin).toDouble();
+
+    for (var y = yMin; y < yMax; y++) {
+      var bright = 0;
+      for (var x = xMin; x < xMax; x++) {
+        if (gray.getPixel(x, y).r.toDouble() > thr) bright++;
+      }
+      rowBrightFrac[y] = bright / rowDen;
+    }
+    for (var x = xMin; x < xMax; x++) {
+      var bright = 0;
+      for (var y = yMin; y < yMax; y++) {
+        if (gray.getPixel(x, y).r.toDouble() > thr) bright++;
+      }
+      colBrightFrac[x] = bright / colDen;
+    }
+
+    const fracTh = 0.42;
+    int? top;
+    for (var y = yMin; y < yMax; y++) {
+      if (rowBrightFrac[y] > fracTh) {
+        top = y;
+        break;
+      }
+    }
+    int? bottom;
+    for (var y = yMax - 1; y >= yMin; y--) {
+      if (rowBrightFrac[y] > fracTh) {
+        bottom = y;
+        break;
+      }
+    }
+    int? left;
+    for (var x = xMin; x < xMax; x++) {
+      if (colBrightFrac[x] > fracTh) {
+        left = x;
+        break;
+      }
+    }
+    int? right;
+    for (var x = xMax - 1; x >= xMin; x--) {
+      if (colBrightFrac[x] > fracTh) {
+        right = x;
+        break;
+      }
+    }
+
+    if (top == null || bottom == null || left == null || right == null) {
+      return null;
+    }
+    if (right <= left || bottom <= top) return null;
+
+    // Small margin so we don’t clip the card border.
+    const m = 0.03;
+    final mx = ((right - left) * m).round().clamp(2, 24);
+    final my = ((bottom - top) * m).round().clamp(2, 24);
+    return (
+      (left! - mx).clamp(0, w - 2),
+      (top! - my).clamp(0, h - 2),
+      (right! + mx).clamp(2, w - 1),
+      (bottom! + my).clamp(2, h - 1),
+    );
+  }
+
+  (int, int, int, int)? _coarseBoxFromEdgeHull(img.Image gray) {
+    final w = gray.width;
+    final h = gray.height;
+
+    final rowEnergy = List<double>.filled(h, 0);
+    final colEnergy = List<double>.filled(w, 0);
+
+    for (var y = 1; y < h - 1; y++) {
+      for (var x = 1; x < w - 1; x++) {
+        final c = gray.getPixel(x, y).r.toDouble();
+        final rx = gray.getPixel(x + 1, y).r.toDouble();
+        final by = gray.getPixel(x, y + 1).r.toDouble();
+        final e = (rx - c).abs() + (by - c).abs();
+        rowEnergy[y] += e;
+        colEnergy[x] += e;
+      }
+    }
+
+    final rowMax = rowEnergy.reduce(math.max);
+    final colMax = colEnergy.reduce(math.max);
+    if (rowMax <= 0 || colMax <= 0) return null;
+
+    // Higher threshold = ignore weak fabric texture; hull shrinks toward subject.
+    final rowThresh = rowMax * 0.52;
+    final colThresh = colMax * 0.52;
+
+    var top = 0;
+    while (top < h && rowEnergy[top] < rowThresh) {
+      top++;
+    }
+    var bottom = h - 1;
+    while (bottom >= 0 && rowEnergy[bottom] < rowThresh) {
+      bottom--;
+    }
+    var left = 0;
+    while (left < w && colEnergy[left] < colThresh) {
+      left++;
+    }
+    var right = w - 1;
+    while (right >= 0 && colEnergy[right] < colThresh) {
+      right--;
+    }
+
+    if (right <= left || bottom <= top) return null;
+    return (left, top, right, bottom);
+  }
+
+  /// Move each edge to the strongest 1D edge response within a band around the coarse edge.
+  (int, int, int, int) _refineBoxByLocalEdges(
+    img.Image gray,
+    int left,
+    int top,
+    int right,
+    int bottom,
+  ) {
+    final w = gray.width;
+    final h = gray.height;
+
+    final x0 = (w * 0.10).round().clamp(1, w - 3);
+    final x1 = (w * 0.90).round().clamp(2, w - 2);
+    final y0 = (h * 0.10).round().clamp(1, h - 3);
+    final y1 = (h * 0.90).round().clamp(2, h - 2);
+
+    final bandY = (0.06 * h).round().clamp(4, 48);
+    final bandX = (0.06 * w).round().clamp(4, 48);
+
+    double horizStrength(int y) {
+      if (y <= 0 || y >= h - 1) return 0;
+      var s = 0.0;
+      for (var x = x0; x < x1; x++) {
+        s += (gray.getPixel(x, y).r - gray.getPixel(x, y - 1).r).abs().toDouble();
+      }
+      return s;
+    }
+
+    double vertStrength(int x) {
+      if (x <= 0 || x >= w - 1) return 0;
+      var s = 0.0;
+      for (var y = y0; y < y1; y++) {
+        s += (gray.getPixel(x, y).r - gray.getPixel(x - 1, y).r).abs().toDouble();
+      }
+      return s;
+    }
+
+    // Top: search downward from (coarse top - band) to (coarse top + band).
+    var bestTop = top;
+    var bestTopScore = horizStrength(top.clamp(1, h - 2));
+    final t0 = (top - bandY).clamp(1, h - 2);
+    final t1 = (top + bandY).clamp(1, h - 2);
+    for (var y = t0; y <= t1; y++) {
+      final s = horizStrength(y);
+      if (s > bestTopScore) {
+        bestTopScore = s;
+        bestTop = y;
+      }
+    }
+
+    var bestBottom = bottom;
+    var bestBottomScore = horizStrength(bottom.clamp(1, h - 2));
+    final b0 = (bottom - bandY).clamp(1, h - 2);
+    final b1 = (bottom + bandY).clamp(1, h - 2);
+    for (var y = b0; y <= b1; y++) {
+      final s = horizStrength(y);
+      if (s > bestBottomScore) {
+        bestBottomScore = s;
+        bestBottom = y;
+      }
+    }
+
+    var bestLeft = left;
+    var bestLeftScore = vertStrength(left.clamp(1, w - 2));
+    final l0 = (left - bandX).clamp(1, w - 2);
+    final l1 = (left + bandX).clamp(1, w - 2);
+    for (var x = l0; x <= l1; x++) {
+      final s = vertStrength(x);
+      if (s > bestLeftScore) {
+        bestLeftScore = s;
+        bestLeft = x;
+      }
+    }
+
+    var bestRight = right;
+    var bestRightScore = vertStrength(right.clamp(1, w - 2));
+    final r0 = (right - bandX).clamp(1, w - 2);
+    final r1 = (right + bandX).clamp(1, w - 2);
+    for (var x = r0; x <= r1; x++) {
+      final s = vertStrength(x);
+      if (s > bestRightScore) {
+        bestRightScore = s;
+        bestRight = x;
+      }
+    }
+
+    if (bestRight <= bestLeft || bestBottom <= bestTop) {
+      return (left, top, right, bottom);
+    }
+    return (bestLeft, bestTop, bestRight, bestBottom);
+  }
+
+  List<Offset>? _buildValidatedAutoRect(
+    double left,
+    double top,
+    double right,
+    double bottom,
+    double w,
+    double h,
+  ) {
+    final boxW = right - left;
+    final boxH = bottom - top;
+    if (boxW <= 0 || boxH <= 0) return null;
+
+    final areaRatio = (boxW * boxH) / (w * h);
+    final aspect = boxW / boxH;
+    if (areaRatio < 0.10 || areaRatio > 0.92) return null;
+    if (aspect < 0.7 || aspect > 2.8) return null;
+
+    final centerX = (left + right) / 2;
+    final centerY = (top + bottom) / 2;
+    final nx = (centerX - w / 2).abs() / (w / 2);
+    final ny = (centerY - h / 2).abs() / (h / 2);
+    if (nx > 0.75 || ny > 0.75) return null;
+
+    return <Offset>[
+      Offset((left / w).clamp(0.0, 1.0), (top / h).clamp(0.0, 1.0)),
+      Offset((right / w).clamp(0.0, 1.0), (top / h).clamp(0.0, 1.0)),
+      Offset((right / w).clamp(0.0, 1.0), (bottom / h).clamp(0.0, 1.0)),
+      Offset((left / w).clamp(0.0, 1.0), (bottom / h).clamp(0.0, 1.0)),
     ];
   }
 
@@ -121,6 +531,7 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
   void _moveCorner(int index, Offset delta) {
     final size = _viewSize!;
     setState(() {
+      _hasUserAdjustedCorners = true;
       final c = _corners![index];
       _corners![index] = Offset(
         (c.dx + delta.dx).clamp(0.0, size.width),
