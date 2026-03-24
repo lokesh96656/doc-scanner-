@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image_picker/image_picker.dart';
@@ -44,7 +45,28 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
   bool _hasUserAdjustedCorners = false;
 
   static const double _handleSize = 20;
+  /// Minimum inset from screen edges for the **center** of each handle so the
+  /// touch target stays on-screen and drags work at extreme left/right.
+  static const double _cornerCenterInset = 26;
+  /// Material-like min touch target (visual handle stays smaller, centered).
+  static const double _touchTarget = 48;
   static const double _minEdge = 30;
+
+  double _draggableInset(double width, double height) {
+    final m = math.min(width, height) / 2 - 2;
+    return _cornerCenterInset.clamp(0.0, m > 0 ? m : 0.0);
+  }
+
+  void _applySafeCornerInsets(double width, double height) {
+    if (_corners == null) return;
+    final p = _draggableInset(width, height);
+    for (var i = 0; i < 4; i++) {
+      _corners![i] = Offset(
+        _corners![i].dx.clamp(p, width - p),
+        _corners![i].dy.clamp(p, height - p),
+      );
+    }
+  }
 
   /// Order: topLeft, topRight, bottomRight, bottomLeft
   void _initCorners(double width, double height) {
@@ -56,15 +78,16 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
       _corners = _autoCorners01!
           .map((p) => Offset(p.dx * width, p.dy * height))
           .toList(growable: false);
-      return;
+    } else {
+      _corners = [
+        Offset(width * margin, height * margin),
+        Offset(width * (1 - margin), height * margin),
+        Offset(width * (1 - margin), height * (1 - margin)),
+        Offset(width * margin, height * (1 - margin)),
+      ];
     }
 
-    _corners = [
-      Offset(width * margin, height * margin),
-      Offset(width * (1 - margin), height * margin),
-      Offset(width * (1 - margin), height * (1 - margin)),
-      Offset(width * margin, height * (1 - margin)),
-    ];
+    _applySafeCornerInsets(width, height);
   }
 
   @override
@@ -98,6 +121,7 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
           _corners = auto01
               .map((p) => Offset(p.dx * _viewSize!.width, p.dy * _viewSize!.height))
               .toList(growable: false);
+          _applySafeCornerInsets(_viewSize!.width, _viewSize!.height);
         }
       });
     } catch (_) {
@@ -493,6 +517,8 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
                 final height = constraints.maxHeight;
                 _viewSize ??= Size(width, height);
                 _initCorners(width, height);
+                // Keep handles grabbable when auto-detect snaps to image edges.
+                _applySafeCornerInsets(width, height);
                 final corners = _corners!;
 
                 return Stack(
@@ -530,12 +556,13 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
 
   void _moveCorner(int index, Offset delta) {
     final size = _viewSize!;
+    final p = _draggableInset(size.width, size.height);
     setState(() {
       _hasUserAdjustedCorners = true;
       final c = _corners![index];
       _corners![index] = Offset(
-        (c.dx + delta.dx).clamp(0.0, size.width),
-        (c.dy + delta.dy).clamp(0.0, size.height),
+        (c.dx + delta.dx).clamp(p, size.width - p),
+        (c.dy + delta.dy).clamp(p, size.height - p),
       );
     });
   }
@@ -579,19 +606,27 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
 
   Widget _buildHandle(Offset position, void Function(Offset delta) onDrag) {
     return Positioned(
-      left: position.dx - _handleSize / 2,
-      top: position.dy - _handleSize / 2,
+      left: position.dx - _touchTarget / 2,
+      top: position.dy - _touchTarget / 2,
       child: GestureDetector(
+        dragStartBehavior: DragStartBehavior.down,
+        behavior: HitTestBehavior.opaque,
         onPanUpdate: (details) {
           onDrag(details.delta);
         },
-        child: Container(
-          width: _handleSize,
-          height: _handleSize,
-          decoration: BoxDecoration(
-            color: Colors.white,
-            border: Border.all(color: Colors.blue, width: 2),
-            shape: BoxShape.circle,
+        child: SizedBox(
+          width: _touchTarget,
+          height: _touchTarget,
+          child: Center(
+            child: Container(
+              width: _handleSize,
+              height: _handleSize,
+              decoration: BoxDecoration(
+                color: Colors.white,
+                border: Border.all(color: Colors.blue, width: 2),
+                shape: BoxShape.circle,
+              ),
+            ),
           ),
         ),
       ),
