@@ -1531,12 +1531,6 @@ class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
                                     ? 'Captured'
                                     : 'Hold steady…'),
                           ),
-                          const SizedBox(height: 6),
-                          Text(
-                            'Stability: ${(_stableFrames / _neededStableFrames * 100).clamp(0, 100).toStringAsFixed(0)}%  '
-                            'Diff: ${_lastDiff.toStringAsFixed(1)}  '
-                            'Sharp: ${_lastSharpness.toStringAsFixed(1)}',
-                          ),
                         ],
                       ),
                     ),
