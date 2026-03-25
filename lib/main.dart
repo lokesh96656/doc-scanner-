@@ -568,13 +568,18 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
   }
 
   /// Detects tilt angle (degrees) from text block orientation in the cropped image.
+  /// Uses a small thumbnail so ML Kit is fast (full-size PNG was very slow).
   Future<double> _detectTiltAngle(img.Image image) async {
     final dir = await getTemporaryDirectory();
     final tempPath =
-        '${dir.path}/_tilt_${DateTime.now().millisecondsSinceEpoch}.png';
+        '${dir.path}/_tilt_${DateTime.now().millisecondsSinceEpoch}.jpg';
     final tempFile = File(tempPath);
     try {
-      await tempFile.writeAsBytes(img.encodePng(image));
+      var probe = image;
+      if (image.width > 400) {
+        probe = img.copyResize(image, width: 400);
+      }
+      await tempFile.writeAsBytes(img.encodeJpg(probe, quality: 82));
       final inputImage = InputImage.fromFilePath(tempPath);
       final recognizer = TextRecognizer();
       final result = await recognizer.processImage(inputImage);
@@ -650,14 +655,26 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
     final w2 = _dist(srcQuad[3], srcQuad[2]);
     final h1 = _dist(srcQuad[0], srcQuad[3]);
     final h2 = _dist(srcQuad[1], srcQuad[2]);
-    final outW = (math.max(w1, w2)).round().clamp(1, original.width);
-    final outH = (math.max(h1, h2)).round().clamp(1, original.height);
+    // Full-resolution warp is O(outW*outH) in Dart — cap for sub‑second UX on phones.
+    const maxSide = 640;
+    var outW = (math.max(w1, w2)).round().clamp(1, original.width);
+    var outH = (math.max(h1, h2)).round().clamp(1, original.height);
+    if (outW > maxSide || outH > maxSide) {
+      if (outW >= outH) {
+        outH = (outH * maxSide / outW).round().clamp(1, original.height);
+        outW = maxSide;
+      } else {
+        outW = (outW * maxSide / outH).round().clamp(1, original.width);
+        outH = maxSide;
+      }
+    }
 
     img.Image? work = _perspectiveWarp(original, srcQuad, outW, outH);
     if (work == null) return null;
 
+    // Light tilt fix only if needed; OCR runs on small thumbnail inside _detectTiltAngle.
     final tiltAngle = await _detectTiltAngle(work);
-    if (tiltAngle.abs() > 0.5) {
+    if (tiltAngle.abs() > 1.2) {
       work = img.copyRotate(work, angle: -tiltAngle);
     }
 
@@ -666,9 +683,9 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
 
     final dir = await getTemporaryDirectory();
     final outPath =
-        '${dir.path}/scan_${DateTime.now().millisecondsSinceEpoch}.png';
+        '${dir.path}/scan_${DateTime.now().millisecondsSinceEpoch}.jpg';
     final outFile = File(outPath);
-    await outFile.writeAsBytes(img.encodePng(enhanced));
+    await outFile.writeAsBytes(img.encodeJpg(enhanced, quality: 90));
     return outFile;
   }
 
