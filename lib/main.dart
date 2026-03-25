@@ -1,8 +1,11 @@
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'dart:typed_data';
+
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:image/image.dart' as img;
@@ -27,6 +30,223 @@ class MyApp extends StatelessWidget {
       home: const MyHomePage(title: 'Flutter Demo Home Page'),
     );
   }
+}
+
+enum _DocTemplate { auto, aadhaarIN, panIN, drivingLicenseIN, unknown }
+
+String _templateLabel(_DocTemplate t) {
+  switch (t) {
+    case _DocTemplate.auto:
+      return 'Auto';
+    case _DocTemplate.aadhaarIN:
+      return 'Aadhaar (India)';
+    case _DocTemplate.panIN:
+      return 'PAN (India)';
+    case _DocTemplate.drivingLicenseIN:
+      return 'Driving Licence (India)';
+    case _DocTemplate.unknown:
+      return 'Unknown';
+  }
+}
+
+String _normalizeOcr(String s) {
+  // Keep it simple: normalize whitespace and uppercase for keyword checks.
+  return s.replaceAll('\r', '\n').replaceAll(RegExp(r'[ \t]+'), ' ').trim();
+}
+
+(_DocTemplate, double) _detectTemplate(String text) {
+  final upper = text.toUpperCase();
+
+  double scorePan = 0;
+  double scoreAadhaar = 0;
+  double scoreDl = 0;
+
+  // PAN signals
+  if (upper.contains('INCOME TAX')) scorePan += 2;
+  if (upper.contains('PERMANENT ACCOUNT NUMBER')) scorePan += 2;
+  if (RegExp(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b').hasMatch(upper)) scorePan += 3;
+
+  // Aadhaar signals
+  if (upper.contains('UIDAI')) scoreAadhaar += 2;
+  if (upper.contains('GOVERNMENT OF INDIA')) scoreAadhaar += 2;
+  if (upper.contains('AADHAAR')) scoreAadhaar += 2;
+  if (RegExp(r'\b[2-9][0-9]{3}\s?[0-9]{4}\s?[0-9]{4}\b').hasMatch(upper)) {
+    scoreAadhaar += 3;
+  }
+
+  // Driving Licence signals (India-leaning keywords)
+  if (upper.contains('DRIVING LICENCE') || upper.contains('DRIVING LICENSE')) {
+    scoreDl += 2;
+  }
+  if (upper.contains('DL NO') || upper.contains('DLNO') || upper.contains('DL.')) {
+    scoreDl += 2;
+  }
+  if (upper.contains('TRANSPORT')) scoreDl += 1;
+  if (RegExp(r'\bLMV\b').hasMatch(upper)) scoreDl += 1;
+
+  final best = math.max(scorePan, math.max(scoreAadhaar, scoreDl));
+  if (best <= 2) return (_DocTemplate.unknown, 0.0);
+
+  if (best == scoreAadhaar) return (_DocTemplate.aadhaarIN, (best / 8).clamp(0.0, 1.0));
+  if (best == scorePan) return (_DocTemplate.panIN, (best / 8).clamp(0.0, 1.0));
+  return (_DocTemplate.drivingLicenseIN, (best / 8).clamp(0.0, 1.0));
+}
+
+Map<String, String> _extractFields(_DocTemplate type, String text) {
+  final upper = text.toUpperCase();
+  switch (type) {
+    case _DocTemplate.panIN:
+      return _extractPanFields(upper, text);
+    case _DocTemplate.aadhaarIN:
+      return _extractAadhaarFields(upper, text);
+    case _DocTemplate.drivingLicenseIN:
+      return _extractDlFields(upper, text);
+    case _DocTemplate.auto:
+    case _DocTemplate.unknown:
+      return const {};
+  }
+}
+
+Map<String, bool> _validateFields(_DocTemplate type, Map<String, String> fields) {
+  bool match(String key, RegExp re) => fields[key] != null && re.hasMatch(fields[key]!);
+
+  switch (type) {
+    case _DocTemplate.panIN:
+      return {
+        'PAN': match('PAN', RegExp(r'^[A-Z]{5}[0-9]{4}[A-Z]$')),
+        'DOB': fields['DOB'] != null && fields['DOB']!.isNotEmpty,
+        'Name': fields['Name'] != null && fields['Name']!.isNotEmpty,
+      };
+    case _DocTemplate.aadhaarIN:
+      return {
+        'Aadhaar': fields['Aadhaar'] != null &&
+            RegExp(r'^[2-9][0-9]{11}$').hasMatch(fields['Aadhaar']!.replaceAll(' ', '')),
+        'DOB/YOB': fields['DOB/YOB'] != null && fields['DOB/YOB']!.isNotEmpty,
+        'Name': fields['Name'] != null && fields['Name']!.isNotEmpty,
+      };
+    case _DocTemplate.drivingLicenseIN:
+      return {
+        'DL No': fields['DL No'] != null && fields['DL No']!.length >= 8,
+        'DOB': fields['DOB'] != null && fields['DOB']!.isNotEmpty,
+        'Name': fields['Name'] != null && fields['Name']!.isNotEmpty,
+      };
+    case _DocTemplate.auto:
+    case _DocTemplate.unknown:
+      return const {};
+  }
+}
+
+Map<String, String> _extractPanFields(String upper, String original) {
+  final out = <String, String>{};
+  final pan = RegExp(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b').firstMatch(upper)?.group(0);
+  if (pan != null) out['PAN'] = pan;
+
+  // DOB often looks like DD/MM/YYYY or DD-MM-YYYY
+  final dob = RegExp(r'\b[0-3]?\d[\/\-][0-1]?\d[\/\-](19|20)\d{2}\b')
+      .firstMatch(original)
+      ?.group(0);
+  if (dob != null) out['DOB'] = dob;
+
+  // Heuristic: pick longest ALLCAPS line that's not a header and not PAN.
+  final lines = upper.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+  final candidates = lines.where((l) {
+    if (l.contains('INCOME TAX')) return false;
+    if (l.contains('DEPARTMENT')) return false;
+    if (l.contains('GOVT')) return false;
+    if (pan != null && l.contains(pan)) return false;
+    return RegExp(r'^[A-Z .]+$').hasMatch(l) && l.length >= 6;
+  }).toList();
+  if (candidates.isNotEmpty) {
+    candidates.sort((a, b) => b.length.compareTo(a.length));
+    out['Name'] = candidates.first.replaceAll(RegExp(r'\s+'), ' ').trim();
+  }
+  return out;
+}
+
+Map<String, String> _extractAadhaarFields(String upper, String original) {
+  final out = <String, String>{};
+  final aadhaar = RegExp(r'\b[2-9][0-9]{3}\s?[0-9]{4}\s?[0-9]{4}\b')
+      .firstMatch(original)
+      ?.group(0);
+  if (aadhaar != null) out['Aadhaar'] = aadhaar.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+  // DOB or YOB
+  final dob = RegExp(r'\bDOB\s*[:\-]?\s*([0-3]?\d[\/\-][0-1]?\d[\/\-](19|20)\d{2})\b',
+          caseSensitive: false)
+      .firstMatch(original)
+      ?.group(1);
+  final yob = RegExp(r'\bYOB\s*[:\-]?\s*((19|20)\d{2})\b', caseSensitive: false)
+      .firstMatch(original)
+      ?.group(1);
+  if (dob != null) {
+    out['DOB/YOB'] = dob;
+  } else if (yob != null) {
+    out['DOB/YOB'] = yob;
+  }
+
+  final gender = RegExp(r'\b(MALE|FEMALE|TRANSGENDER)\b', caseSensitive: false)
+      .firstMatch(original)
+      ?.group(1);
+  if (gender != null) out['Gender'] = gender;
+
+  // Name: often first strong title-cased line before DOB/YOB.
+  final lines = original
+      .split('\n')
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty)
+      .toList();
+  for (final l in lines) {
+    final u = l.toUpperCase();
+    if (u.contains('GOVERNMENT OF INDIA') || u.contains('UIDAI') || u.contains('AADHAAR')) {
+      continue;
+    }
+    if (RegExp(r'\bDOB\b|\bYOB\b', caseSensitive: false).hasMatch(l)) break;
+    if (RegExp(r'^[A-Za-z][A-Za-z .]{4,}$').hasMatch(l) && !RegExp(r'\d').hasMatch(l)) {
+      out['Name'] = l.replaceAll(RegExp(r'\s+'), ' ').trim();
+      break;
+    }
+  }
+  return out;
+}
+
+Map<String, String> _extractDlFields(String upper, String original) {
+  final out = <String, String>{};
+  final dl = RegExp(r'\b([A-Z]{2}\s?[0-9]{2}\s?[0-9]{4,})\b')
+      .firstMatch(upper)
+      ?.group(1);
+  if (dl != null) out['DL No'] = dl.replaceAll(RegExp(r'\s+'), '').trim();
+
+  final dob = RegExp(r'\b[0-3]?\d[\/\-][0-1]?\d[\/\-](19|20)\d{2}\b')
+      .firstMatch(original)
+      ?.group(0);
+  if (dob != null) out['DOB'] = dob;
+
+  // Name guess: first title-cased-ish line after "Name" label if present.
+  final nameMatch = RegExp(r'\bNAME\b\s*[:\-]?\s*([A-Za-z .]{4,})', caseSensitive: false)
+      .firstMatch(original);
+  if (nameMatch != null) {
+    out['Name'] = nameMatch.group(1)!.trim();
+    return out;
+  }
+
+  // Fallback: first alpha line with no digits, not headers.
+  final lines = original
+      .split('\n')
+      .map((e) => e.trim())
+      .where((e) => e.isNotEmpty)
+      .toList();
+  for (final l in lines) {
+    final u = l.toUpperCase();
+    if (u.contains('DRIVING') || u.contains('LICENCE') || u.contains('LICENSE')) continue;
+    if (u.contains('UNION') || u.contains('TRANSPORT')) continue;
+    if (RegExp(r'\d').hasMatch(l)) continue;
+    if (l.length < 5) continue;
+    if (RegExp(r'^[A-Za-z][A-Za-z .]+$').hasMatch(l)) {
+      out['Name'] = l.replaceAll(RegExp(r'\s+'), ' ').trim();
+      break;
+    }
+  }
+  return out;
 }
 
 class _CropDocumentScreen extends StatefulWidget {
@@ -865,6 +1085,11 @@ class _MyHomePageState extends State<MyHomePage> {
   double? _matchPercent;
   bool? _isTitleMatch;
 
+  _DocTemplate _detectedTemplate = _DocTemplate.unknown;
+  double? _templateConfidence;
+  Map<String, String> _extractedFields = const {};
+  Map<String, bool> _fieldValid = const {};
+
   @override
   void dispose() {
     _titleController.dispose();
@@ -948,14 +1173,14 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Future<void> _scanDocument() async {
     try {
-      final XFile? pickedFile = await _picker.pickImage(
-        source: ImageSource.camera,
-        preferredCameraDevice: CameraDevice.rear,
+      final String? capturedPath = await Navigator.of(context).push<String?>(
+        MaterialPageRoute(builder: (_) => const _AutoCaptureCameraScreen()),
       );
 
-      if (pickedFile == null) {
+      if (capturedPath == null) {
         return;
       }
+      final pickedFile = XFile(capturedPath);
 
       // Let user adjust document corners before OCR.
       final File? croppedFile = await Navigator.of(context).push<File?>(
@@ -987,12 +1212,28 @@ class _MyHomePageState extends State<MyHomePage> {
         _isProcessing = false;
       });
       _updateMatch();
+      _runTemplatePipeline(recognizedText.text);
     } catch (e) {
       setState(() {
         _isProcessing = false;
         _recognizedText = 'Error: $e';
       });
     }
+  }
+
+  void _runTemplatePipeline(String ocrText) {
+    final normalized = _normalizeOcr(ocrText);
+    final (_DocTemplate type, double confidence) = _detectTemplate(normalized);
+
+    final fields = _extractFields(type, normalized);
+    final validity = _validateFields(type, fields);
+
+    setState(() {
+      _detectedTemplate = type;
+      _templateConfidence = confidence;
+      _extractedFields = fields;
+      _fieldValid = validity;
+    });
   }
 
   @override
@@ -1017,6 +1258,42 @@ class _MyHomePageState extends State<MyHomePage> {
               SizedBox(
                 height: 200,
                 child: Image.file(File(_imageFile!.path)),
+              ),
+            ],
+            const SizedBox(height: 16),
+            if (_recognizedText.isNotEmpty)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Detected: ${_templateLabel(_detectedTemplate)}',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+            if (_extractedFields.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: _extractedFields.entries.map((e) {
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 6),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: Text('${e.key}: ${e.value}'),
+                          ),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                ),
               ),
             ],
             const SizedBox(height: 16),
@@ -1068,6 +1345,205 @@ class _MyHomePageState extends State<MyHomePage> {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _AutoCaptureCameraScreen extends StatefulWidget {
+  const _AutoCaptureCameraScreen();
+
+  @override
+  State<_AutoCaptureCameraScreen> createState() => _AutoCaptureCameraScreenState();
+}
+
+class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
+  CameraController? _controller;
+  bool _isInitializing = true;
+  bool _isCapturing = false;
+
+  // Stability/blur checks
+  List<int>? _prevLuma; // small grayscale sample
+  int _stableFrames = 0;
+  double _lastDiff = 999;
+  double _lastSharpness = 0;
+
+  static const int _sampleW = 64;
+  static const int _sampleH = 48;
+  static const int _neededStableFrames = 12; // ~1s if we process ~12fps
+  static const double _diffThreshold = 6.0; // lower = stricter
+  static const double _sharpnessThreshold = 12.0; // higher = stricter
+
+  @override
+  void initState() {
+    super.initState();
+    _initCamera();
+  }
+
+  Future<void> _initCamera() async {
+    try {
+      final cameras = await availableCameras();
+      final back = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+      final controller = CameraController(
+        back,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+      await controller.initialize();
+      await controller.setFlashMode(FlashMode.off);
+      await controller.startImageStream(_onFrame);
+      if (!mounted) return;
+      setState(() {
+        _controller = controller;
+        _isInitializing = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.of(context).pop<String?>(null);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  void _onFrame(CameraImage image) {
+    if (_isCapturing) return;
+    // Process only Y plane (luma) for speed.
+    final plane = image.planes.first;
+    final bytes = plane.bytes;
+    final rowStride = plane.bytesPerRow;
+
+    final sample = List<int>.filled(_sampleW * _sampleH, 0);
+    final stepX = (image.width / _sampleW).floor().clamp(1, image.width);
+    final stepY = (image.height / _sampleH).floor().clamp(1, image.height);
+
+    var idx = 0;
+    for (var sy = 0; sy < _sampleH; sy++) {
+      final y = (sy * stepY).clamp(0, image.height - 1);
+      final rowOff = y * rowStride;
+      for (var sx = 0; sx < _sampleW; sx++) {
+        final x = (sx * stepX).clamp(0, image.width - 1);
+        sample[idx++] = bytes[rowOff + x];
+      }
+    }
+
+    final sharp = _estimateSharpness(sample);
+    final diff = _prevLuma == null ? 999.0 : _meanAbsDiff(_prevLuma!, sample);
+    _prevLuma = sample;
+
+    _lastDiff = diff;
+    _lastSharpness = sharp;
+
+    final stable = diff < _diffThreshold && sharp > _sharpnessThreshold;
+    _stableFrames = stable ? (_stableFrames + 1) : 0;
+
+    if (_stableFrames >= _neededStableFrames) {
+      _capture();
+    } else {
+      if (mounted) setState(() {});
+    }
+  }
+
+  double _meanAbsDiff(List<int> a, List<int> b) {
+    var sum = 0;
+    for (var i = 0; i < a.length; i++) {
+      sum += (a[i] - b[i]).abs();
+    }
+    return sum / a.length;
+  }
+
+  // Simple sharpness proxy: average absolute gradient in the downsampled luma.
+  double _estimateSharpness(List<int> luma) {
+    double sum = 0;
+    int count = 0;
+    for (var y = 0; y < _sampleH - 1; y++) {
+      for (var x = 0; x < _sampleW - 1; x++) {
+        final i = y * _sampleW + x;
+        final gx = (luma[i + 1] - luma[i]).abs();
+        final gy = (luma[i + _sampleW] - luma[i]).abs();
+        sum += gx + gy;
+        count++;
+      }
+    }
+    return count == 0 ? 0 : sum / count;
+  }
+
+  Future<void> _capture() async {
+    if (_isCapturing) return;
+    setState(() => _isCapturing = true);
+    try {
+      final c = _controller;
+      if (c == null) return;
+      await c.stopImageStream();
+      final file = await c.takePicture();
+      if (!mounted) return;
+      Navigator.of(context).pop<String>(file.path);
+    } catch (_) {
+      if (!mounted) return;
+      Navigator.of(context).pop<String?>(null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = _controller;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Auto Capture'),
+        actions: [
+          TextButton(
+            onPressed: _isCapturing ? null : _capture,
+            child: const Text('Capture now'),
+          )
+        ],
+      ),
+      body: _isInitializing || c == null
+          ? const Center(child: CircularProgressIndicator())
+          : Stack(
+              children: [
+                Positioned.fill(child: CameraPreview(c)),
+                Positioned(
+                  left: 16,
+                  right: 16,
+                  bottom: 24,
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.55),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: DefaultTextStyle(
+                      style: const TextStyle(color: Colors.white),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _isCapturing
+                                ? 'Capturing...'
+                                : (_stableFrames >= _neededStableFrames
+                                    ? 'Captured'
+                                    : 'Hold steady…'),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Stability: ${(_stableFrames / _neededStableFrames * 100).clamp(0, 100).toStringAsFixed(0)}%  '
+                            'Diff: ${_lastDiff.toStringAsFixed(1)}  '
+                            'Sharp: ${_lastSharpness.toStringAsFixed(1)}',
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
     );
   }
 }
