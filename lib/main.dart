@@ -1,13 +1,13 @@
 import 'dart:io';
 import 'dart:math' as math;
 
-import 'dart:typed_data';
+import 'dart:convert';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 
@@ -32,221 +32,232 @@ class MyApp extends StatelessWidget {
   }
 }
 
-enum _DocTemplate { auto, aadhaarIN, panIN, drivingLicenseIN, unknown }
-
-String _templateLabel(_DocTemplate t) {
-  switch (t) {
-    case _DocTemplate.auto:
-      return 'Auto';
-    case _DocTemplate.aadhaarIN:
-      return 'Aadhaar (India)';
-    case _DocTemplate.panIN:
-      return 'PAN (India)';
-    case _DocTemplate.drivingLicenseIN:
-      return 'Driving Licence (India)';
-    case _DocTemplate.unknown:
-      return 'Unknown';
-  }
-}
-
 String _normalizeOcr(String s) {
   // Keep it simple: normalize whitespace and uppercase for keyword checks.
   return s.replaceAll('\r', '\n').replaceAll(RegExp(r'[ \t]+'), ' ').trim();
 }
 
-(_DocTemplate, double) _detectTemplate(String text) {
-  final upper = text.toUpperCase();
+RegExp _jsonRegex(String pattern, {bool defaultCaseSensitive = false}) {
+  // Accept optional leading inline flags used in JSON patterns: (?i), (?m), (?im), (?mi)
+  // and translate them to Dart RegExp options.
+  var p = pattern;
+  var caseSensitive = defaultCaseSensitive;
+  var multiLine = false;
 
-  double scorePan = 0;
-  double scoreAadhaar = 0;
-  double scoreDl = 0;
-
-  // PAN signals
-  if (upper.contains('INCOME TAX')) scorePan += 2;
-  if (upper.contains('PERMANENT ACCOUNT NUMBER')) scorePan += 2;
-  if (RegExp(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b').hasMatch(upper)) scorePan += 3;
-
-  // Aadhaar signals
-  if (upper.contains('UIDAI')) scoreAadhaar += 2;
-  if (upper.contains('GOVERNMENT OF INDIA')) scoreAadhaar += 2;
-  if (upper.contains('AADHAAR')) scoreAadhaar += 2;
-  if (RegExp(r'\b[2-9][0-9]{3}\s?[0-9]{4}\s?[0-9]{4}\b').hasMatch(upper)) {
-    scoreAadhaar += 3;
+  final m = RegExp(r'^\(\?([im]+)\)').firstMatch(pattern);
+  if (m != null) {
+    final flags = m.group(1)!;
+    caseSensitive = !flags.contains('i');
+    multiLine = flags.contains('m');
+    p = pattern.substring(m.end);
   }
 
-  // Driving Licence signals (India-leaning keywords)
-  if (upper.contains('DRIVING LICENCE') || upper.contains('DRIVING LICENSE')) {
-    scoreDl += 2;
-  }
-  if (upper.contains('DL NO') || upper.contains('DLNO') || upper.contains('DL.')) {
-    scoreDl += 2;
-  }
-  if (upper.contains('TRANSPORT')) scoreDl += 1;
-  if (RegExp(r'\bLMV\b').hasMatch(upper)) scoreDl += 1;
-
-  final best = math.max(scorePan, math.max(scoreAadhaar, scoreDl));
-  if (best <= 2) return (_DocTemplate.unknown, 0.0);
-
-  if (best == scoreAadhaar) return (_DocTemplate.aadhaarIN, (best / 8).clamp(0.0, 1.0));
-  if (best == scorePan) return (_DocTemplate.panIN, (best / 8).clamp(0.0, 1.0));
-  return (_DocTemplate.drivingLicenseIN, (best / 8).clamp(0.0, 1.0));
-}
-
-Map<String, String> _extractFields(_DocTemplate type, String text) {
-  final upper = text.toUpperCase();
-  switch (type) {
-    case _DocTemplate.panIN:
-      return _extractPanFields(upper, text);
-    case _DocTemplate.aadhaarIN:
-      return _extractAadhaarFields(upper, text);
-    case _DocTemplate.drivingLicenseIN:
-      return _extractDlFields(upper, text);
-    case _DocTemplate.auto:
-    case _DocTemplate.unknown:
-      return const {};
+  try {
+    return RegExp(p, caseSensitive: caseSensitive, multiLine: multiLine);
+  } catch (_) {
+    // Keep engine alive even if one bad pattern slips into JSON.
+    return RegExp(r'$.');
   }
 }
 
-Map<String, bool> _validateFields(_DocTemplate type, Map<String, String> fields) {
-  bool match(String key, RegExp re) => fields[key] != null && re.hasMatch(fields[key]!);
+class _JsonTemplateEngine {
+  _JsonTemplateEngine(this.templates);
 
-  switch (type) {
-    case _DocTemplate.panIN:
-      return {
-        'PAN': match('PAN', RegExp(r'^[A-Z]{5}[0-9]{4}[A-Z]$')),
-        'DOB': fields['DOB'] != null && fields['DOB']!.isNotEmpty,
-        'Name': fields['Name'] != null && fields['Name']!.isNotEmpty,
-      };
-    case _DocTemplate.aadhaarIN:
-      return {
-        'Aadhaar': fields['Aadhaar'] != null &&
-            RegExp(r'^[2-9][0-9]{11}$').hasMatch(fields['Aadhaar']!.replaceAll(' ', '')),
-        'DOB/YOB': fields['DOB/YOB'] != null && fields['DOB/YOB']!.isNotEmpty,
-        'Name': fields['Name'] != null && fields['Name']!.isNotEmpty,
-      };
-    case _DocTemplate.drivingLicenseIN:
-      return {
-        'DL No': fields['DL No'] != null && fields['DL No']!.length >= 8,
-        'DOB': fields['DOB'] != null && fields['DOB']!.isNotEmpty,
-        'Name': fields['Name'] != null && fields['Name']!.isNotEmpty,
-      };
-    case _DocTemplate.auto:
-    case _DocTemplate.unknown:
-      return const {};
-  }
-}
+  final List<_JsonTemplate> templates;
 
-Map<String, String> _extractPanFields(String upper, String original) {
-  final out = <String, String>{};
-  final pan = RegExp(r'\b[A-Z]{5}[0-9]{4}[A-Z]\b').firstMatch(upper)?.group(0);
-  if (pan != null) out['PAN'] = pan;
-
-  // DOB often looks like DD/MM/YYYY or DD-MM-YYYY
-  final dob = RegExp(r'\b[0-3]?\d[\/\-][0-1]?\d[\/\-](19|20)\d{2}\b')
-      .firstMatch(original)
-      ?.group(0);
-  if (dob != null) out['DOB'] = dob;
-
-  // Heuristic: pick longest ALLCAPS line that's not a header and not PAN.
-  final lines = upper.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
-  final candidates = lines.where((l) {
-    if (l.contains('INCOME TAX')) return false;
-    if (l.contains('DEPARTMENT')) return false;
-    if (l.contains('GOVT')) return false;
-    if (pan != null && l.contains(pan)) return false;
-    return RegExp(r'^[A-Z .]+$').hasMatch(l) && l.length >= 6;
-  }).toList();
-  if (candidates.isNotEmpty) {
-    candidates.sort((a, b) => b.length.compareTo(a.length));
-    out['Name'] = candidates.first.replaceAll(RegExp(r'\s+'), ' ').trim();
-  }
-  return out;
-}
-
-Map<String, String> _extractAadhaarFields(String upper, String original) {
-  final out = <String, String>{};
-  final aadhaar = RegExp(r'\b[2-9][0-9]{3}\s?[0-9]{4}\s?[0-9]{4}\b')
-      .firstMatch(original)
-      ?.group(0);
-  if (aadhaar != null) out['Aadhaar'] = aadhaar.replaceAll(RegExp(r'\s+'), ' ').trim();
-
-  // DOB or YOB
-  final dob = RegExp(r'\bDOB\s*[:\-]?\s*([0-3]?\d[\/\-][0-1]?\d[\/\-](19|20)\d{2})\b',
-          caseSensitive: false)
-      .firstMatch(original)
-      ?.group(1);
-  final yob = RegExp(r'\bYOB\s*[:\-]?\s*((19|20)\d{2})\b', caseSensitive: false)
-      .firstMatch(original)
-      ?.group(1);
-  if (dob != null) {
-    out['DOB/YOB'] = dob;
-  } else if (yob != null) {
-    out['DOB/YOB'] = yob;
+  static Future<_JsonTemplateEngine> loadFromAssets() async {
+    final raw = await rootBundle.loadString('assets/templates/id_templates.json');
+    final map = jsonDecode(raw) as Map<String, dynamic>;
+    final list = (map['templates'] as List? ?? const [])
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList(growable: false);
+    final templates = list.map(_JsonTemplate.fromJson).toList(growable: false);
+    return _JsonTemplateEngine(templates);
   }
 
-  final gender = RegExp(r'\b(MALE|FEMALE|TRANSGENDER)\b', caseSensitive: false)
-      .firstMatch(original)
-      ?.group(1);
-  if (gender != null) out['Gender'] = gender;
+  _JsonTemplateResult detect(String ocrText) {
+    final normalized = _normalizeOcr(ocrText);
+    final upper = normalized.toUpperCase();
 
-  // Name: often first strong title-cased line before DOB/YOB.
-  final lines = original
-      .split('\n')
-      .map((e) => e.trim())
-      .where((e) => e.isNotEmpty)
-      .toList();
-  for (final l in lines) {
-    final u = l.toUpperCase();
-    if (u.contains('GOVERNMENT OF INDIA') || u.contains('UIDAI') || u.contains('AADHAAR')) {
-      continue;
+    _JsonTemplate? bestQualified;
+    int bestQualifiedScore = -1;
+    _JsonTemplate? bestAny;
+    int bestAnyScore = -1;
+    for (final t in templates) {
+      final score = t.score(upper);
+      if (score > bestAnyScore) {
+        bestAnyScore = score;
+        bestAny = t;
+      }
+      if (score >= t.minScore && score > bestQualifiedScore) {
+        bestQualifiedScore = score;
+        bestQualified = t;
+      }
     }
-    if (RegExp(r'\bDOB\b|\bYOB\b', caseSensitive: false).hasMatch(l)) break;
-    if (RegExp(r'^[A-Za-z][A-Za-z .]{4,}$').hasMatch(l) && !RegExp(r'\d').hasMatch(l)) {
-      out['Name'] = l.replaceAll(RegExp(r'\s+'), ' ').trim();
-      break;
+
+    final selected = bestQualified ?? (bestAnyScore >= 2 ? bestAny : null);
+    if (selected == null) {
+      return const _JsonTemplateResult(
+        displayName: 'Unknown',
+        fields: {},
+        valid: {},
+      );
     }
+
+    final fields = selected.extract(normalized);
+    final valid = selected.validate(fields);
+    return _JsonTemplateResult(
+      displayName: selected.displayName,
+      fields: fields,
+      valid: valid,
+    );
   }
-  return out;
 }
 
-Map<String, String> _extractDlFields(String upper, String original) {
-  final out = <String, String>{};
-  final dl = RegExp(r'\b([A-Z]{2}\s?[0-9]{2}\s?[0-9]{4,})\b')
-      .firstMatch(upper)
-      ?.group(1);
-  if (dl != null) out['DL No'] = dl.replaceAll(RegExp(r'\s+'), '').trim();
+class _JsonTemplateResult {
+  const _JsonTemplateResult({
+    required this.displayName,
+    required this.fields,
+    required this.valid,
+  });
 
-  final dob = RegExp(r'\b[0-3]?\d[\/\-][0-1]?\d[\/\-](19|20)\d{2}\b')
-      .firstMatch(original)
-      ?.group(0);
-  if (dob != null) out['DOB'] = dob;
+  final String displayName;
+  final Map<String, String> fields;
+  final Map<String, bool> valid;
+}
 
-  // Name guess: first title-cased-ish line after "Name" label if present.
-  final nameMatch = RegExp(r'\bNAME\b\s*[:\-]?\s*([A-Za-z .]{4,})', caseSensitive: false)
-      .firstMatch(original);
-  if (nameMatch != null) {
-    out['Name'] = nameMatch.group(1)!.trim();
+class _JsonTemplate {
+  _JsonTemplate({
+    required this.id,
+    required this.displayName,
+    required this.minScore,
+    required this.keywordRules,
+    required this.regexRules,
+    required this.extractRules,
+    required this.validateRules,
+  });
+
+  final String id;
+  final String displayName;
+  final int minScore;
+  final List<_JsonKeywordRule> keywordRules;
+  final List<_JsonRegexRule> regexRules;
+  final Map<String, _JsonExtractRule> extractRules;
+  final Map<String, RegExp> validateRules;
+
+  factory _JsonTemplate.fromJson(Map<String, dynamic> j) {
+    final detect = Map<String, dynamic>.from(j['detect'] as Map? ?? const {});
+    final minScore = (detect['minScore'] as num? ?? 0).toInt();
+    final keywords = (detect['keywords'] as List? ?? const [])
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .map((k) => _JsonKeywordRule(
+              text: k['text'] as String,
+              weight: (k['weight'] as num).toInt(),
+            ))
+        .toList(growable: false);
+    final regex = (detect['regex'] as List? ?? const [])
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .map((r) => _JsonRegexRule(
+              re: _jsonRegex(r['pattern'] as String),
+              weight: (r['weight'] as num).toInt(),
+            ))
+        .toList(growable: false);
+
+    final extract = Map<String, dynamic>.from(j['extract'] as Map? ?? const {})
+        .map((k, v) => MapEntry(k, _JsonExtractRule.fromJson(Map<String, dynamic>.from(v as Map))));
+
+    final validate = Map<String, dynamic>.from(j['validate'] as Map? ?? const {})
+        .map((k, v) => MapEntry(k, _jsonRegex(Map<String, dynamic>.from(v as Map)['regex'] as String)));
+
+    return _JsonTemplate(
+      id: j['id'] as String,
+      displayName: j['displayName'] as String,
+      minScore: minScore,
+      keywordRules: keywords,
+      regexRules: regex,
+      extractRules: extract,
+      validateRules: validate,
+    );
+  }
+
+  int score(String upperText) {
+    var s = 0;
+    for (final k in keywordRules) {
+      if (upperText.contains(k.text.toUpperCase())) s += k.weight;
+    }
+    for (final r in regexRules) {
+      if (r.re.hasMatch(upperText)) s += r.weight;
+    }
+    return s;
+  }
+
+  Map<String, String> extract(String normalized) {
+    final out = <String, String>{};
+    for (final entry in extractRules.entries) {
+      final v = entry.value.apply(normalized);
+      if (v != null && v.trim().isNotEmpty) out[entry.key] = v.trim();
+    }
     return out;
   }
 
-  // Fallback: first alpha line with no digits, not headers.
-  final lines = original
-      .split('\n')
-      .map((e) => e.trim())
-      .where((e) => e.isNotEmpty)
-      .toList();
-  for (final l in lines) {
-    final u = l.toUpperCase();
-    if (u.contains('DRIVING') || u.contains('LICENCE') || u.contains('LICENSE')) continue;
-    if (u.contains('UNION') || u.contains('TRANSPORT')) continue;
-    if (RegExp(r'\d').hasMatch(l)) continue;
-    if (l.length < 5) continue;
-    if (RegExp(r'^[A-Za-z][A-Za-z .]+$').hasMatch(l)) {
-      out['Name'] = l.replaceAll(RegExp(r'\s+'), ' ').trim();
-      break;
+  Map<String, bool> validate(Map<String, String> fields) {
+    final out = <String, bool>{};
+    for (final entry in validateRules.entries) {
+      final v = fields[entry.key];
+      if (v == null) continue;
+      out[entry.key] = entry.value.hasMatch(v.trim());
     }
+    return out;
   }
-  return out;
+}
+
+class _JsonKeywordRule {
+  const _JsonKeywordRule({required this.text, required this.weight});
+  final String text;
+  final int weight;
+}
+
+class _JsonRegexRule {
+  const _JsonRegexRule({required this.re, required this.weight});
+  final RegExp re;
+  final int weight;
+}
+
+class _JsonExtractRule {
+  _JsonExtractRule({
+    required this.re,
+    required this.group,
+    required this.fallbackGroup,
+    required this.normalize,
+  });
+
+  final RegExp re;
+  final int group;
+  final int? fallbackGroup;
+  final String? normalize;
+
+  factory _JsonExtractRule.fromJson(Map<String, dynamic> j) {
+    return _JsonExtractRule(
+      re: _jsonRegex(j['regex'] as String),
+      group: (j['group'] as num?)?.toInt() ?? 0,
+      fallbackGroup: (j['fallbackGroup'] as num?)?.toInt(),
+      normalize: j['normalize'] as String?,
+    );
+  }
+
+  String? apply(String text) {
+    final m = re.firstMatch(text);
+    if (m == null) return null;
+    String? v = m.group(group);
+    if ((v == null || v.isEmpty) && fallbackGroup != null) v = m.group(fallbackGroup!);
+    if (v == null) return null;
+    if (normalize == 'spaces_remove') {
+      v = v.replaceAll(RegExp(r'\s+'), '');
+    } else if (normalize == 'spaces_collapse') {
+      v = v.replaceAll(RegExp(r'\s+'), ' ');
+    }
+    return v;
+  }
 }
 
 class _CropDocumentScreen extends StatefulWidget {
@@ -270,7 +281,6 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
   static const double _cornerCenterInset = 26;
   /// Material-like min touch target (visual handle stays smaller, centered).
   static const double _touchTarget = 48;
-  static const double _minEdge = 30;
 
   double _draggableInset(double width, double height) {
     final m = math.min(width, height) / 2 - 2;
@@ -360,14 +370,14 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
     double? minX, minY, maxX, maxY;
     for (final block in result.blocks) {
       final pts = block.cornerPoints;
-      if (pts == null || pts.isEmpty) continue;
+      if (pts.isEmpty) continue;
       for (final p in pts) {
         final x = p.x.toDouble();
         final y = p.y.toDouble();
-        minX = minX == null ? x : math.min(minX!, x);
-        minY = minY == null ? y : math.min(minY!, y);
-        maxX = maxX == null ? x : math.max(maxX!, x);
-        maxY = maxY == null ? y : math.max(maxY!, y);
+        minX = minX == null ? x : math.min(minX, x);
+        minY = minY == null ? y : math.min(minY, y);
+        maxX = maxX == null ? x : math.max(maxX, x);
+        maxY = maxY == null ? y : math.max(maxY, y);
       }
     }
 
@@ -381,13 +391,13 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
     }
 
     // Smaller padding — tight around text keeps corners closer to the card.
-    final padX = (maxX! - minX!) * 0.06;
-    final padY = (maxY! - minY!) * 0.10;
+    final padX = (maxX - minX) * 0.06;
+    final padY = (maxY - minY) * 0.10;
 
-    final left = (minX! - padX).clamp(0.0, width.toDouble());
-    final top = (minY! - padY).clamp(0.0, height.toDouble());
-    final right = (maxX! + padX).clamp(0.0, width.toDouble());
-    final bottom = (maxY! + padY).clamp(0.0, height.toDouble());
+    final left = (minX - padX).clamp(0.0, width.toDouble());
+    final top = (minY - padY).clamp(0.0, height.toDouble());
+    final right = (maxX + padX).clamp(0.0, width.toDouble());
+    final bottom = (maxY + padY).clamp(0.0, height.toDouble());
 
     return _buildValidatedAutoRect(left, top, right, bottom, width.toDouble(), height.toDouble());
   }
@@ -532,10 +542,10 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
     final mx = ((right - left) * m).round().clamp(2, 24);
     final my = ((bottom - top) * m).round().clamp(2, 24);
     return (
-      (left! - mx).clamp(0, w - 2),
-      (top! - my).clamp(0, h - 2),
-      (right! + mx).clamp(2, w - 1),
-      (bottom! + my).clamp(2, h - 1),
+      (left - mx).clamp(0, w - 2),
+      (top - my).clamp(0, h - 2),
+      (right + mx).clamp(2, w - 1),
+      (bottom + my).clamp(2, h - 1),
     );
   }
 
@@ -722,6 +732,7 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
                 return;
               }
               final cropped = await _cropAndEnhance();
+              if (!context.mounted) return;
               Navigator.of(context).pop<File?>(cropped);
             },
             child: const Text('Done'),
@@ -809,7 +820,7 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
       int count = 0;
       for (final block in result.blocks) {
         final pts = block.cornerPoints;
-        if (pts != null && pts.length >= 2) {
+        if (pts.length >= 2) {
           final p0 = pts[0];
           final p1 = pts[1];
           final dx = (p1.x - p0.x).toDouble();
@@ -974,11 +985,15 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
       a[maxRow] = tmp;
       if (a[col][col].abs() < 1e-12) return null;
       final pivot = a[col][col];
-      for (var j = 0; j <= n; j++) a[col][j] /= pivot;
+      for (var j = 0; j <= n; j++) {
+        a[col][j] /= pivot;
+      }
       for (var row = 0; row < n; row++) {
         if (row == col) continue;
         final f = a[row][col];
-        for (var j = 0; j <= n; j++) a[row][j] -= f * a[col][j];
+        for (var j = 0; j <= n; j++) {
+          a[row][j] -= f * a[col][j];
+        }
       }
     }
     return List.generate(n, (i) => a[i][n]);
@@ -1030,7 +1045,7 @@ class _QuadOverlayPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final overlayPaint = Paint()..color = Colors.black.withOpacity(0.5);
+    final overlayPaint = Paint()..color = Colors.black.withValues(alpha: 0.5);
     canvas.drawRect(Offset.zero & size, overlayPaint);
 
     final path = Path()..moveTo(corners[0].dx, corners[0].dy);
@@ -1074,52 +1089,81 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  final ImagePicker _picker = ImagePicker();
   final TextRecognizer _textRecognizer = TextRecognizer();
-  final TextEditingController _titleController = TextEditingController();
+  final TextEditingController _documentNumberController = TextEditingController();
 
   String _recognizedText = '';
   bool _isProcessing = false;
   XFile? _imageFile;
-  String? _detectedTitle;
+  String? _detectedDocumentNumber;
   double? _matchPercent;
-  bool? _isTitleMatch;
+  bool? _isDocumentNumberMatch;
 
-  _DocTemplate _detectedTemplate = _DocTemplate.unknown;
-  double? _templateConfidence;
   Map<String, String> _extractedFields = const {};
-  Map<String, bool> _fieldValid = const {};
+  String _detectedTemplateText = 'Unknown';
+  _JsonTemplateEngine? _jsonTemplates;
+  bool _jsonLoading = false;
+  String? _pendingOcrForJson;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadJsonTemplates();
+  }
 
   @override
   void dispose() {
-    _titleController.dispose();
+    _documentNumberController.dispose();
     _textRecognizer.close();
     super.dispose();
   }
 
-  String? _extractTitle(String text) {
-    final lines = text.split('\n');
-    final regex = RegExp(
-      r'title\s*:\s*(.+)',
-      caseSensitive: false,
-    );
-    for (final line in lines) {
-      final match = regex.firstMatch(line);
-      if (match != null) {
-        return match.group(1)?.trim();
+  Future<void> _loadJsonTemplates() async {
+    if (_jsonTemplates != null || _jsonLoading) return;
+    _jsonLoading = true;
+    try {
+      final engine = await _JsonTemplateEngine.loadFromAssets();
+      if (!mounted) return;
+      setState(() => _jsonTemplates = engine);
+      final pending = _pendingOcrForJson;
+      if (pending != null) {
+        _pendingOcrForJson = null;
+        _runTemplatePipeline(pending);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _detectedTemplateText = 'Template load failed');
+    } finally {
+      _jsonLoading = false;
+    }
+  }
+
+  String? _pickDocumentNumberFromFields(Map<String, String> fields) {
+    const keysByPriority = <String>[
+      'PAN',
+      'Aadhaar',
+      'DL No',
+      'Licence No',
+      'Passport No',
+      'Document No',
+    ];
+    for (final k in keysByPriority) {
+      final v = fields[k];
+      if (v != null && v.trim().isNotEmpty) {
+        return v.trim();
       }
     }
     return null;
   }
 
-  void _updateMatch() {
-    final expected = _titleController.text.trim();
-    final detected = _detectedTitle?.trim() ?? '';
+  void _updateDocumentNumberMatch() {
+    final expected = _documentNumberController.text.trim();
+    final detected = _detectedDocumentNumber?.trim() ?? '';
 
     if (expected.isEmpty || detected.isEmpty) {
       setState(() {
         _matchPercent = null;
-        _isTitleMatch = null;
+        _isDocumentNumberMatch = null;
       });
       return;
     }
@@ -1129,7 +1173,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     setState(() {
       _matchPercent = similarity * 100;
-      _isTitleMatch = similarity >= 0.8;
+      _isDocumentNumberMatch = similarity >= 0.8;
     });
   }
 
@@ -1176,6 +1220,7 @@ class _MyHomePageState extends State<MyHomePage> {
       final String? capturedPath = await Navigator.of(context).push<String?>(
         MaterialPageRoute(builder: (_) => const _AutoCaptureCameraScreen()),
       );
+      if (!mounted) return;
 
       if (capturedPath == null) {
         return;
@@ -1188,6 +1233,7 @@ class _MyHomePageState extends State<MyHomePage> {
           builder: (_) => _CropDocumentScreen(imagePath: pickedFile.path),
         ),
       );
+      if (!mounted) return;
 
       if (croppedFile == null) {
         return;
@@ -1196,9 +1242,9 @@ class _MyHomePageState extends State<MyHomePage> {
       setState(() {
         _isProcessing = true;
         _recognizedText = '';
-        _detectedTitle = null;
+        _detectedDocumentNumber = null;
         _matchPercent = null;
-        _isTitleMatch = null;
+        _isDocumentNumberMatch = null;
         _imageFile = XFile(croppedFile.path);
       });
 
@@ -1208,10 +1254,8 @@ class _MyHomePageState extends State<MyHomePage> {
 
       setState(() {
         _recognizedText = recognizedText.text;
-        _detectedTitle = _extractTitle(recognizedText.text);
         _isProcessing = false;
       });
-      _updateMatch();
       _runTemplatePipeline(recognizedText.text);
     } catch (e) {
       setState(() {
@@ -1222,18 +1266,23 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _runTemplatePipeline(String ocrText) {
-    final normalized = _normalizeOcr(ocrText);
-    final (_DocTemplate type, double confidence) = _detectTemplate(normalized);
+    final engine = _jsonTemplates;
+    if (engine == null) {
+      _pendingOcrForJson = ocrText;
+      if (_detectedTemplateText != 'Loading…') {
+        setState(() => _detectedTemplateText = 'Loading…');
+      }
+      _loadJsonTemplates();
+      return;
+    }
 
-    final fields = _extractFields(type, normalized);
-    final validity = _validateFields(type, fields);
-
+    final result = engine.detect(ocrText);
     setState(() {
-      _detectedTemplate = type;
-      _templateConfidence = confidence;
-      _extractedFields = fields;
-      _fieldValid = validity;
+      _detectedTemplateText = result.displayName;
+      _extractedFields = result.fields;
+      _detectedDocumentNumber = _pickDocumentNumberFromFields(result.fields);
     });
+    _updateDocumentNumberMatch();
   }
 
   @override
@@ -1265,7 +1314,7 @@ class _MyHomePageState extends State<MyHomePage> {
               Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  'Detected: ${_templateLabel(_detectedTemplate)}',
+                  'Detected: $_detectedTemplateText',
                   style: const TextStyle(fontWeight: FontWeight.w600),
                 ),
               ),
@@ -1298,47 +1347,57 @@ class _MyHomePageState extends State<MyHomePage> {
             ],
             const SizedBox(height: 16),
             TextField(
-              controller: _titleController,
+              controller: _documentNumberController,
               decoration: const InputDecoration(
-                labelText: 'Enter expected title',
+                labelText: 'Enter document number',
                 border: OutlineInputBorder(),
               ),
-              onChanged: (_) => _updateMatch(),
+              onChanged: (_) => _updateDocumentNumberMatch(),
             ),
             const SizedBox(height: 12),
-            if (_detectedTitle != null)
+            if (_detectedDocumentNumber != null)
               Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  'Detected title: $_detectedTitle',
+                  'Detected document number: $_detectedDocumentNumber',
                   style: const TextStyle(fontWeight: FontWeight.w500),
                 ),
               )
             else if (_recognizedText.isNotEmpty)
               const Align(
                 alignment: Alignment.centerLeft,
-                child: Text('No "Title:" section found in image.'),
+                child: Text('No document number found in extracted fields.'),
               ),
             const SizedBox(height: 8),
-            if (_matchPercent != null && _isTitleMatch != null)
+            if (_matchPercent != null && _isDocumentNumberMatch != null)
               Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  'Match: ${_isTitleMatch! ? 'True' : 'False'} '
+                  'Match: ${_isDocumentNumberMatch! ? 'True' : 'False'} '
                   '(${_matchPercent!.toStringAsFixed(1)}%)',
                   style: TextStyle(
                     fontWeight: FontWeight.bold,
-                    color: _isTitleMatch! ? Colors.green : Colors.red,
+                    color: _isDocumentNumberMatch! ? Colors.green : Colors.red,
                   ),
                 ),
               ),
             const SizedBox(height: 16),
             Expanded(
               child: SingleChildScrollView(
-                child: SelectableText(
-                  _recognizedText.isEmpty
-                      ? 'Captured text will appear here.'
-                      : _recognizedText,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Extracted text from document',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 8),
+                    SelectableText(
+                      _recognizedText.isEmpty
+                          ? 'Captured text will appear here.'
+                          : _recognizedText,
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -1364,8 +1423,6 @@ class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
   // Stability/blur checks
   List<int>? _prevLuma; // small grayscale sample
   int _stableFrames = 0;
-  double _lastDiff = 999;
-  double _lastSharpness = 0;
 
   static const int _sampleW = 64;
   static const int _sampleH = 48;
@@ -1437,8 +1494,7 @@ class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
     final diff = _prevLuma == null ? 999.0 : _meanAbsDiff(_prevLuma!, sample);
     _prevLuma = sample;
 
-    _lastDiff = diff;
-    _lastSharpness = sharp;
+    // Keep only the stable frame count; we don't show raw metrics in UI.
 
     final stable = diff < _diffThreshold && sharp > _sharpnessThreshold;
     _stableFrames = stable ? (_stableFrames + 1) : 0;
@@ -1515,7 +1571,7 @@ class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
                   child: Container(
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.55),
+                      color: Colors.black.withValues(alpha: 0.55),
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: DefaultTextStyle(

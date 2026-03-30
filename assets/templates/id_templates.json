@@ -1,0 +1,132 @@
+{
+  "version": 1,
+  "templates": [
+    {
+      "id": "in.aadhaar",
+      "displayName": "Aadhaar (India)",
+      "detect": {
+        "minScore": 4,
+        "keywords": [
+          { "text": "UIDAI", "weight": 2 },
+          { "text": "GOVERNMENT OF INDIA", "weight": 2 },
+          { "text": "AADHAAR", "weight": 2 }
+        ],
+        "regex": [
+          { "pattern": "\\b[2-9][0-9]{3}\\s?[0-9]{4}\\s?[0-9]{4}\\b", "weight": 3 }
+        ]
+      },
+      "extract": {
+        "Aadhaar": { "regex": "\\b[2-9][0-9]{3}\\s?[0-9]{4}\\s?[0-9]{4}\\b", "normalize": "spaces_collapse" },
+        "DOB/YOB": { "regex": "\\b(?:DOB\\s*[:\\-]?\\s*([0-3]?\\d[\\/-][0-1]?\\d[\\/-](?:19|20)\\d{2})|YOB\\s*[:\\-]?\\s*((?:19|20)\\d{2}))\\b", "group": 1, "fallbackGroup": 2 },
+        "Gender": { "regex": "\\b(MALE|FEMALE|TRANSGENDER)\\b", "group": 1 }
+      },
+      "validate": {
+        "Aadhaar": { "regex": "^[2-9][0-9]{3}\\s?[0-9]{4}\\s?[0-9]{4}$" }
+      }
+    },
+    {
+      "id": "in.pan",
+      "displayName": "PAN (India)",
+      "detect": {
+        "minScore": 4,
+        "keywords": [
+          { "text": "INCOME TAX", "weight": 2 },
+          { "text": "PERMANENT ACCOUNT NUMBER", "weight": 2 }
+        ],
+        "regex": [
+          { "pattern": "\\b[A-Z]{5}[0-9]{4}[A-Z]\\b", "weight": 3 }
+        ]
+      },
+      "extract": {
+        "PAN": { "regex": "\\b[A-Z]{5}[0-9]{4}[A-Z]\\b" },
+        "DOB": { "regex": "\\b[0-3]?\\d[\\/-][0-1]?\\d[\\/-](?:19|20)\\d{2}\\b" }
+      },
+      "validate": {
+        "PAN": { "regex": "^[A-Z]{5}[0-9]{4}[A-Z]$" }
+      }
+    },
+    {
+      "id": "in.dl",
+      "displayName": "Driving Licence (India)",
+      "detect": {
+        "minScore": 3,
+        "keywords": [
+          { "text": "DRIVING LICENCE", "weight": 2 },
+          { "text": "DL NO", "weight": 2 },
+          { "text": "TRANSPORT", "weight": 1 },
+          { "text": "LMV", "weight": 1 },
+          { "text": "MCWG", "weight": 1 }
+        ],
+        "regex": [
+          { "pattern": "\\bDL\\s*NO\\b", "weight": 1 }
+        ]
+      },
+      "extract": {
+        "DL No": { "regex": "\\bDL\\s*NO\\s*[:\\-]?\\s*([A-Z0-9\\-\\/ ]{8,})\\b", "group": 1, "normalize": "spaces_collapse" },
+        "DOB": { "regex": "\\b[0-3]?\\d[\\/-][0-1]?\\d[\\/-](?:19|20)\\d{2}\\b" }
+      }
+    },
+    {
+      "id": "uk.dl",
+      "displayName": "Driving Licence (UK)",
+      "detect": {
+        "minScore": 4,
+        "keywords": [
+          { "text": "DVLA", "weight": 2 },
+          { "text": "DRIVING LICENCE", "weight": 1 },
+          { "text": "LICENCE NO", "weight": 1 }
+        ],
+        "regex": [
+          { "pattern": "\\b[A-Z]{5}\\d{6}[A-Z0-9]{5}\\b", "weight": 4 }
+        ]
+      },
+      "extract": {
+        "Licence No": { "regex": "\\b[A-Z]{5}\\d{6}[A-Z0-9]{5}\\b" },
+        "DOB": { "regex": "\\b[0-3]?\\d[\\/-][0-1]?\\d[\\/-](?:19|20)\\d{2}\\b" }
+      },
+      "validate": {
+        "Licence No": { "regex": "^[A-Z]{5}\\d{6}[A-Z0-9]{5}$" }
+      }
+    },
+    {
+      "id": "uk.passport",
+      "displayName": "Passport (UK)",
+      "detect": {
+        "minScore": 5,
+        "keywords": [
+          { "text": "PASSPORT", "weight": 1 },
+          { "text": "UNITED KINGDOM", "weight": 1 },
+          { "text": "GBR", "weight": 1 }
+        ],
+        "regex": [
+          { "pattern": "(?m)^\\s*P<", "weight": 4 },
+          { "pattern": "(?m)^[A-Z0-9<]{25,}\\s*$", "weight": 2 }
+        ]
+      },
+      "extract": {
+        "Passport No": { "regex": "\\b[0-9]{9}\\b" }
+      }
+    },
+    {
+      "id": "uk.brp",
+      "displayName": "BRP/BRC (UK)",
+      "detect": {
+        "minScore": 4,
+        "keywords": [
+          { "text": "RESIDENCE PERMIT", "weight": 3 },
+          { "text": "UKVI", "weight": 2 },
+          { "text": "HOME OFFICE", "weight": 2 },
+          { "text": "BIOMETRIC", "weight": 1 }
+        ],
+        "regex": [
+          { "pattern": "\\b[A-Z]{2}\\d{7}\\b", "weight": 1 }
+        ]
+      },
+      "extract": {
+        "Document No": { "regex": "\\b[A-Z]{2}\\d{7}\\b|\\b\\d{9}\\b" },
+        "DOB": { "regex": "\\b[0-3]?\\d[\\/-][0-1]?\\d[\\/-](?:19|20)\\d{2}\\b" }
+      }
+    }
+  ]
+}
+
