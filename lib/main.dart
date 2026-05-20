@@ -11,6 +11,8 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 
+import 'face/face_match_service.dart';
+
 void main() {
   runApp(const MyApp());
 }
@@ -66,7 +68,9 @@ class _JsonTemplateEngine {
   final List<_JsonTemplate> templates;
 
   static Future<_JsonTemplateEngine> loadFromAssets() async {
-    final raw = await rootBundle.loadString('assets/templates/id_templates.json');
+    final raw = await rootBundle.loadString(
+      'assets/templates/id_templates.json',
+    );
     final map = jsonDecode(raw) as Map<String, dynamic>;
     final list = (map['templates'] as List? ?? const [])
         .map((e) => Map<String, dynamic>.from(e as Map))
@@ -150,24 +154,38 @@ class _JsonTemplate {
     final minScore = (detect['minScore'] as num? ?? 0).toInt();
     final keywords = (detect['keywords'] as List? ?? const [])
         .map((e) => Map<String, dynamic>.from(e as Map))
-        .map((k) => _JsonKeywordRule(
-              text: k['text'] as String,
-              weight: (k['weight'] as num).toInt(),
-            ))
+        .map(
+          (k) => _JsonKeywordRule(
+            text: k['text'] as String,
+            weight: (k['weight'] as num).toInt(),
+          ),
+        )
         .toList(growable: false);
     final regex = (detect['regex'] as List? ?? const [])
         .map((e) => Map<String, dynamic>.from(e as Map))
-        .map((r) => _JsonRegexRule(
-              re: _jsonRegex(r['pattern'] as String),
-              weight: (r['weight'] as num).toInt(),
-            ))
+        .map(
+          (r) => _JsonRegexRule(
+            re: _jsonRegex(r['pattern'] as String),
+            weight: (r['weight'] as num).toInt(),
+          ),
+        )
         .toList(growable: false);
 
     final extract = Map<String, dynamic>.from(j['extract'] as Map? ?? const {})
-        .map((k, v) => MapEntry(k, _JsonExtractRule.fromJson(Map<String, dynamic>.from(v as Map))));
+        .map(
+          (k, v) => MapEntry(
+            k,
+            _JsonExtractRule.fromJson(Map<String, dynamic>.from(v as Map)),
+          ),
+        );
 
-    final validate = Map<String, dynamic>.from(j['validate'] as Map? ?? const {})
-        .map((k, v) => MapEntry(k, _jsonRegex(Map<String, dynamic>.from(v as Map)['regex'] as String)));
+    final validate =
+        Map<String, dynamic>.from(j['validate'] as Map? ?? const {}).map(
+          (k, v) => MapEntry(
+            k,
+            _jsonRegex(Map<String, dynamic>.from(v as Map)['regex'] as String),
+          ),
+        );
 
     return _JsonTemplate(
       id: j['id'] as String,
@@ -249,7 +267,8 @@ class _JsonExtractRule {
     final m = re.firstMatch(text);
     if (m == null) return null;
     String? v = m.group(group);
-    if ((v == null || v.isEmpty) && fallbackGroup != null) v = m.group(fallbackGroup!);
+    if ((v == null || v.isEmpty) && fallbackGroup != null)
+      v = m.group(fallbackGroup!);
     if (v == null) return null;
     if (normalize == 'spaces_remove') {
       v = v.replaceAll(RegExp(r'\s+'), '');
@@ -271,14 +290,17 @@ class _CropDocumentScreen extends StatefulWidget {
 
 class _CropDocumentScreenState extends State<_CropDocumentScreen> {
   List<Offset>? _corners;
-  List<Offset>? _autoCorners01; // normalized (0..1) topLeft, topRight, bottomRight, bottomLeft
+  List<Offset>?
+  _autoCorners01; // normalized (0..1) topLeft, topRight, bottomRight, bottomLeft
   Size? _viewSize;
   bool _hasUserAdjustedCorners = false;
 
   static const double _handleSize = 20;
+
   /// Minimum inset from screen edges for the **center** of each handle so the
   /// touch target stays on-screen and drags work at extreme left/right.
   static const double _cornerCenterInset = 26;
+
   /// Material-like min touch target (visual handle stays smaller, centered).
   static const double _touchTarget = 48;
 
@@ -338,7 +360,11 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
       recognizer.close();
 
       // 1) Try OCR-based rectangle.
-      final ocrAuto01 = _detectAutoCornersFromText(result, decoded.width, decoded.height);
+      final ocrAuto01 = _detectAutoCornersFromText(
+        result,
+        decoded.width,
+        decoded.height,
+      );
       // 2) If OCR is weak, try an edge-based rectangle.
       final auto01 = ocrAuto01 ?? _detectAutoCornersFromEdges(decoded);
       if (auto01 == null) return;
@@ -349,7 +375,10 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
         // Apply automatically unless user has already moved corners manually.
         if (!_hasUserAdjustedCorners && _viewSize != null) {
           _corners = auto01
-              .map((p) => Offset(p.dx * _viewSize!.width, p.dy * _viewSize!.height))
+              .map(
+                (p) =>
+                    Offset(p.dx * _viewSize!.width, p.dy * _viewSize!.height),
+              )
               .toList(growable: false);
           _applySafeCornerInsets(_viewSize!.width, _viewSize!.height);
         }
@@ -399,7 +428,14 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
     final right = (maxX + padX).clamp(0.0, width.toDouble());
     final bottom = (maxY + padY).clamp(0.0, height.toDouble());
 
-    return _buildValidatedAutoRect(left, top, right, bottom, width.toDouble(), height.toDouble());
+    return _buildValidatedAutoRect(
+      left,
+      top,
+      right,
+      bottom,
+      width.toDouble(),
+      height.toDouble(),
+    );
   }
 
   List<Offset>? _detectAutoCornersFromEdges(img.Image decoded) {
@@ -619,7 +655,9 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
       if (y <= 0 || y >= h - 1) return 0;
       var s = 0.0;
       for (var x = x0; x < x1; x++) {
-        s += (gray.getPixel(x, y).r - gray.getPixel(x, y - 1).r).abs().toDouble();
+        s += (gray.getPixel(x, y).r - gray.getPixel(x, y - 1).r)
+            .abs()
+            .toDouble();
       }
       return s;
     }
@@ -628,7 +666,9 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
       if (x <= 0 || x >= w - 1) return 0;
       var s = 0.0;
       for (var y = y0; y < y1; y++) {
-        s += (gray.getPixel(x, y).r - gray.getPixel(x - 1, y).r).abs().toDouble();
+        s += (gray.getPixel(x, y).r - gray.getPixel(x - 1, y).r)
+            .abs()
+            .toDouble();
       }
       return s;
     }
@@ -767,14 +807,10 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
                         ),
                       ),
                     ),
-                    _buildHandle(corners[0], (delta) =>
-                        _moveCorner(0, delta)),
-                    _buildHandle(corners[1], (delta) =>
-                        _moveCorner(1, delta)),
-                    _buildHandle(corners[2], (delta) =>
-                        _moveCorner(2, delta)),
-                    _buildHandle(corners[3], (delta) =>
-                        _moveCorner(3, delta)),
+                    _buildHandle(corners[0], (delta) => _moveCorner(0, delta)),
+                    _buildHandle(corners[1], (delta) => _moveCorner(1, delta)),
+                    _buildHandle(corners[2], (delta) => _moveCorner(2, delta)),
+                    _buildHandle(corners[3], (delta) => _moveCorner(3, delta)),
                   ],
                 );
               },
@@ -880,7 +916,9 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
     final scaleX = original.width / size.width;
     final scaleY = original.height / size.height;
 
-    final srcQuad = corners.map((o) => Offset(o.dx * scaleX, o.dy * scaleY)).toList();
+    final srcQuad = corners
+        .map((o) => Offset(o.dx * scaleX, o.dy * scaleY))
+        .toList();
 
     final w1 = _dist(srcQuad[0], srcQuad[1]);
     final w2 = _dist(srcQuad[3], srcQuad[2]);
@@ -921,12 +959,18 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
   }
 
   double _dist(Offset a, Offset b) {
-    return math.sqrt((a.dx - b.dx) * (a.dx - b.dx) + (a.dy - b.dy) * (a.dy - b.dy));
+    return math.sqrt(
+      (a.dx - b.dx) * (a.dx - b.dx) + (a.dy - b.dy) * (a.dy - b.dy),
+    );
   }
 
   /// Warps source image so quad (topLeft, topRight, bottomRight, bottomLeft) becomes a straight rectangle.
   img.Image? _perspectiveWarp(
-      img.Image src, List<Offset> quad, int outW, int outH) {
+    img.Image src,
+    List<Offset> quad,
+    int outW,
+    int outH,
+  ) {
     if (quad.length != 4) return null;
     final x0 = quad[0].dx;
     final y0 = quad[0].dy;
@@ -1010,30 +1054,34 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
     final p10 = src.getPixel(x1, y0);
     final p01 = src.getPixel(x0, y1);
     final p11 = src.getPixel(x1, y1);
-    final r = (p00.r * (1 - fx) * (1 - fy) +
-            p10.r * fx * (1 - fy) +
-            p01.r * (1 - fx) * fy +
-            p11.r * fx * fy)
-        .round()
-        .clamp(0, 255);
-    final g = (p00.g * (1 - fx) * (1 - fy) +
-            p10.g * fx * (1 - fy) +
-            p01.g * (1 - fx) * fy +
-            p11.g * fx * fy)
-        .round()
-        .clamp(0, 255);
-    final b = (p00.b * (1 - fx) * (1 - fy) +
-            p10.b * fx * (1 - fy) +
-            p01.b * (1 - fx) * fy +
-            p11.b * fx * fy)
-        .round()
-        .clamp(0, 255);
-    final a = (p00.a * (1 - fx) * (1 - fy) +
-            p10.a * fx * (1 - fy) +
-            p01.a * (1 - fx) * fy +
-            p11.a * fx * fy)
-        .round()
-        .clamp(0, 255);
+    final r =
+        (p00.r * (1 - fx) * (1 - fy) +
+                p10.r * fx * (1 - fy) +
+                p01.r * (1 - fx) * fy +
+                p11.r * fx * fy)
+            .round()
+            .clamp(0, 255);
+    final g =
+        (p00.g * (1 - fx) * (1 - fy) +
+                p10.g * fx * (1 - fy) +
+                p01.g * (1 - fx) * fy +
+                p11.g * fx * fy)
+            .round()
+            .clamp(0, 255);
+    final b =
+        (p00.b * (1 - fx) * (1 - fy) +
+                p10.b * fx * (1 - fy) +
+                p01.b * (1 - fx) * fy +
+                p11.b * fx * fy)
+            .round()
+            .clamp(0, 255);
+    final a =
+        (p00.a * (1 - fx) * (1 - fy) +
+                p10.a * fx * (1 - fy) +
+                p01.a * (1 - fx) * fy +
+                p11.a * fx * fy)
+            .round()
+            .clamp(0, 255);
     return img.ColorRgba8(r, g, b, a);
   }
 }
@@ -1090,14 +1138,23 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
   final TextRecognizer _textRecognizer = TextRecognizer();
-  final TextEditingController _documentNumberController = TextEditingController();
+  final FaceMatchService _faceMatchService = FaceMatchService();
+  final TextEditingController _documentNumberController =
+      TextEditingController();
 
   String _recognizedText = '';
   bool _isProcessing = false;
+  String _processingMessage = '';
   XFile? _imageFile;
+  XFile? _selfieFile;
   String? _detectedDocumentNumber;
   double? _matchPercent;
   bool? _isDocumentNumberMatch;
+
+  double? _faceMatchPercent;
+  bool? _isFaceMatchPass;
+  String? _faceMatchError;
+  bool _faceUsedEmbeddingModel = false;
 
   Map<String, String> _extractedFields = const {};
   String _detectedTemplateText = 'Unknown';
@@ -1115,6 +1172,7 @@ class _MyHomePageState extends State<MyHomePage> {
   void dispose() {
     _documentNumberController.dispose();
     _textRecognizer.close();
+    _faceMatchService.dispose();
     super.dispose();
   }
 
@@ -1168,8 +1226,10 @@ class _MyHomePageState extends State<MyHomePage> {
       return;
     }
 
-    final similarity =
-        _calculateSimilarity(expected.toLowerCase(), detected.toLowerCase());
+    final similarity = _calculateSimilarity(
+      expected.toLowerCase(),
+      detected.toLowerCase(),
+    );
 
     setState(() {
       _matchPercent = similarity * 100;
@@ -1187,10 +1247,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     final m = a.length;
     final n = b.length;
-    final dp = List.generate(
-      m + 1,
-      (_) => List<int>.filled(n + 1, 0),
-    );
+    final dp = List.generate(m + 1, (_) => List<int>.filled(n + 1, 0));
 
     for (var i = 0; i <= m; i++) {
       dp[i][0] = i;
@@ -1227,7 +1284,6 @@ class _MyHomePageState extends State<MyHomePage> {
       }
       final pickedFile = XFile(capturedPath);
 
-      // Let user adjust document corners before OCR.
       final File? croppedFile = await Navigator.of(context).push<File?>(
         MaterialPageRoute(
           builder: (_) => _CropDocumentScreen(imagePath: pickedFile.path),
@@ -1239,27 +1295,59 @@ class _MyHomePageState extends State<MyHomePage> {
         return;
       }
 
+      final String? selfiePath = await Navigator.of(context).push<String?>(
+        MaterialPageRoute(builder: (_) => const _SelfieCaptureScreen()),
+      );
+      if (!mounted) return;
+
+      if (selfiePath == null) {
+        return;
+      }
+
       setState(() {
         _isProcessing = true;
+        _processingMessage = 'Running OCR and face match…';
         _recognizedText = '';
         _detectedDocumentNumber = null;
         _matchPercent = null;
         _isDocumentNumberMatch = null;
+        _faceMatchPercent = null;
+        _isFaceMatchPass = null;
+        _faceMatchError = null;
+        _faceUsedEmbeddingModel = false;
         _imageFile = XFile(croppedFile.path);
+        _selfieFile = XFile(selfiePath);
       });
 
-      final inputImage = InputImage.fromFilePath(croppedFile.path);
-      final RecognizedText recognizedText =
-          await _textRecognizer.processImage(inputImage);
+      final idPath = croppedFile.path;
+      final results = await Future.wait<Object?>([
+        _textRecognizer.processImage(InputImage.fromFilePath(idPath)),
+        _faceMatchService.compare(
+          idImagePath: idPath,
+          selfieImagePath: selfiePath,
+        ),
+      ]);
+
+      if (!mounted) return;
+
+      final recognizedText = results[0] as RecognizedText;
+      final faceResult = results[1] as FaceMatchResult;
 
       setState(() {
         _recognizedText = recognizedText.text;
         _isProcessing = false;
+        _processingMessage = '';
+        _faceMatchPercent = faceResult.matchPercent;
+        _isFaceMatchPass = faceResult.pass;
+        _faceMatchError = faceResult.error;
+        _faceUsedEmbeddingModel = faceResult.usedEmbeddingModel;
       });
       _runTemplatePipeline(recognizedText.text);
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _isProcessing = false;
+        _processingMessage = '';
         _recognizedText = 'Error: $e';
       });
     }
@@ -1288,9 +1376,7 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('OCR Document Scanner'),
-      ),
+      appBar: AppBar(title: const Text('OCR Document Scanner')),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -1301,13 +1387,28 @@ class _MyHomePageState extends State<MyHomePage> {
               onPressed: _isProcessing ? null : _scanDocument,
             ),
             const SizedBox(height: 16),
-            if (_isProcessing) const CircularProgressIndicator(),
+            if (_isProcessing) ...[
+              const CircularProgressIndicator(),
+              if (_processingMessage.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(_processingMessage),
+              ],
+            ],
             if (_imageFile != null && !_isProcessing) ...[
               const SizedBox(height: 16),
-              SizedBox(
-                height: 200,
-                child: Image.file(File(_imageFile!.path)),
+              SizedBox(height: 160, child: Image.file(File(_imageFile!.path))),
+            ],
+            if (_selfieFile != null && !_isProcessing) ...[
+              const SizedBox(height: 8),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Selfie',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
               ),
+              const SizedBox(height: 4),
+              SizedBox(height: 120, child: Image.file(File(_selfieFile!.path))),
             ],
             const SizedBox(height: 16),
             if (_recognizedText.isNotEmpty)
@@ -1335,9 +1436,7 @@ class _MyHomePageState extends State<MyHomePage> {
                       child: Row(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Expanded(
-                            child: Text('${e.key}: ${e.value}'),
-                          ),
+                          Expanded(child: Text('${e.key}: ${e.value}')),
                         ],
                       ),
                     );
@@ -1373,12 +1472,41 @@ class _MyHomePageState extends State<MyHomePage> {
               Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  'Match: ${_isDocumentNumberMatch! ? 'True' : 'False'} '
+                  'Document number match: ${_isDocumentNumberMatch! ? 'True' : 'False'} '
                   '(${_matchPercent!.toStringAsFixed(1)}%)',
                   style: TextStyle(
                     fontWeight: FontWeight.bold,
                     color: _isDocumentNumberMatch! ? Colors.green : Colors.red,
                   ),
+                ),
+              ),
+            const SizedBox(height: 12),
+            if (_faceMatchError != null)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  _faceMatchError!,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              )
+            else if (_faceMatchPercent != null && _isFaceMatchPass != null)
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Face match: ${_faceMatchPercent!.toStringAsFixed(1)}% '
+                      '(${_isFaceMatchPass! ? 'Match' : 'No match'})',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: _isFaceMatchPass! ? Colors.green : Colors.red,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             const SizedBox(height: 16),
@@ -1408,11 +1536,121 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 }
 
+class _SelfieCaptureScreen extends StatefulWidget {
+  const _SelfieCaptureScreen();
+
+  @override
+  State<_SelfieCaptureScreen> createState() => _SelfieCaptureScreenState();
+}
+
+class _SelfieCaptureScreenState extends State<_SelfieCaptureScreen> {
+  CameraController? _controller;
+  bool _isInitializing = true;
+  bool _isCapturing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initCamera();
+  }
+
+  Future<void> _initCamera() async {
+    try {
+      final cameras = await availableCameras();
+      final front = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.front,
+        orElse: () => cameras.first,
+      );
+      final controller = CameraController(
+        front,
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
+      await controller.initialize();
+      if (!mounted) return;
+      setState(() {
+        _controller = controller;
+        _isInitializing = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.of(context).pop<String?>(null);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _capture() async {
+    if (_isCapturing) return;
+    setState(() => _isCapturing = true);
+    try {
+      final c = _controller;
+      if (c == null || !c.value.isInitialized) return;
+      final file = await c.takePicture();
+      if (!mounted) return;
+      Navigator.of(context).pop<String>(file.path);
+    } catch (_) {
+      if (!mounted) return;
+      Navigator.of(context).pop<String?>(null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = _controller;
+    return Scaffold(
+      appBar: AppBar(title: const Text('Take selfie')),
+      body: _isInitializing || c == null
+          ? const Center(child: CircularProgressIndicator())
+          : Stack(
+              children: [
+                Positioned.fill(child: CameraPreview(c)),
+                Positioned(
+                  left: 16,
+                  right: 16,
+                  bottom: 24,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.55),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Text(
+                          'Look at the camera. Only your face should be visible.',
+                          style: TextStyle(color: Colors.white),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      FilledButton.icon(
+                        onPressed: _isCapturing ? null : _capture,
+                        icon: const Icon(Icons.face),
+                        label: Text(
+                          _isCapturing ? 'Capturing…' : 'Capture selfie',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+    );
+  }
+}
+
 class _AutoCaptureCameraScreen extends StatefulWidget {
   const _AutoCaptureCameraScreen();
 
   @override
-  State<_AutoCaptureCameraScreen> createState() => _AutoCaptureCameraScreenState();
+  State<_AutoCaptureCameraScreen> createState() =>
+      _AutoCaptureCameraScreenState();
 }
 
 class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
@@ -1556,7 +1794,7 @@ class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
           TextButton(
             onPressed: _isCapturing ? null : _capture,
             child: const Text('Capture now'),
-          )
+          ),
         ],
       ),
       body: _isInitializing || c == null
@@ -1584,8 +1822,8 @@ class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
                             _isCapturing
                                 ? 'Capturing...'
                                 : (_stableFrames >= _neededStableFrames
-                                    ? 'Captured'
-                                    : 'Hold steady…'),
+                                      ? 'Captured'
+                                      : 'Hold steady…'),
                           ),
                         ],
                       ),

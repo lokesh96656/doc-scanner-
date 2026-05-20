@@ -1,4 +1,4 @@
-package com.example.docread_demo
+package com.scriptbytes.documentscanner
 
 import io.flutter.embedding.android.FlutterActivity
 
