@@ -1533,10 +1533,11 @@ class _MyHomePageState extends State<MyHomePage> {
       final nx = cx / imgW;
       final ny = cy / imgH;
 
-      // In selfie+ID photo, card is usually in lower-right; bias toward that,
-      // but still allow other positions.
-      final bias = (0.6 * nx + 0.4 * ny);
-      scored[b] = area * (0.6 + bias);
+      // In selfie+ID photo, card is held below the face (lower-center).
+      final horizontalCenter =
+          (1.0 - ((nx - 0.5).abs() * 2)).clamp(0.0, 1.0);
+      final lowerBonus = ny > 0.38 ? 0.5 + (ny - 0.38) : ny * 0.5;
+      scored[b] = area * (0.5 + horizontalCenter * 0.35 + lowerBonus * 0.25);
     }
     if (scored.isEmpty) return null;
 
@@ -2224,44 +2225,58 @@ class _SelfieWithDocumentCaptureScreenState
                     ),
                   ],
                 )
-              : Stack(
+              : Column(
                   children: [
-                    Positioned.fill(child: CameraPreview(c)),
-                    Positioned.fill(
-                      child: IgnorePointer(
-                        child: CustomPaint(
-                          painter: _SelfieWithDocumentOverlayPainter(
-                            color: Colors.white.withValues(alpha: 0.9),
-                          ),
-                        ),
-                      ),
-                    ),
-                    Positioned(
-                      left: 16,
-                      right: 16,
-                      bottom: 24,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
+                    Expanded(
+                      child: Stack(
+                        fit: StackFit.expand,
                         children: [
-                          Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.black.withValues(alpha: 0.55),
-                              borderRadius: BorderRadius.circular(12),
+                          Positioned.fill(child: CameraPreview(c)),
+                          Positioned.fill(
+                            child: IgnorePointer(
+                              child: CustomPaint(
+                                painter: _SelfieWithDocumentOverlayPainter(
+                                  color: Colors.white.withValues(alpha: 0.9),
+                                ),
+                              ),
                             ),
-                            child: const Text(
-                              'Hold your ID next to your face. Make sure the card text is readable and avoid glare.',
-                              style: TextStyle(color: Colors.white),
-                              textAlign: TextAlign.center,
-                            ),
-                          ),
-                          const SizedBox(height: 16),
-                          FilledButton.icon(
-                            onPressed: _isCapturing ? null : _capture,
-                            icon: const Icon(Icons.camera_alt),
-                            label: Text(_isCapturing ? 'Capturing…' : 'Capture'),
                           ),
                         ],
+                      ),
+                    ),
+                    Material(
+                      elevation: 8,
+                      color: Theme.of(context).colorScheme.surface,
+                      child: SafeArea(
+                        top: false,
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                'Face in oval · ID in box below',
+                                style: Theme.of(context).textTheme.bodyMedium,
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 12),
+                              FilledButton.icon(
+                                onPressed: _isCapturing ? null : _capture,
+                                icon: const Icon(Icons.camera_alt),
+                                label: Text(
+                                  _isCapturing ? 'Capturing…' : 'Capture photo',
+                                ),
+                                style: FilledButton.styleFrom(
+                                  minimumSize: const Size.fromHeight(56),
+                                  padding: const EdgeInsets.symmetric(
+                                    vertical: 14,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
                     ),
                   ],
@@ -2282,23 +2297,60 @@ class _SelfieWithDocumentOverlayPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2.0;
 
-    // Face guide (oval) on left side.
+    final labelStyle = TextStyle(
+      color: color,
+      fontSize: 12,
+      fontWeight: FontWeight.w600,
+    );
+
+    // Vertical layout: tall face oval (center), ID box lower — guides stay in camera area.
+    const gap = 0.10;
+    final faceW = size.width * 0.45;
+    final faceH = size.height * 0.36;
+    final faceCenterY = size.height * 0.22;
+
     final faceRect = Rect.fromCenter(
-      center: Offset(size.width * 0.33, size.height * 0.42),
-      width: size.width * 0.45,
-      height: size.height * 0.38,
+      center: Offset(size.width / 2, faceCenterY),
+      width: faceW,
+      height: faceH,
     );
     canvas.drawOval(faceRect, paint);
+    _drawLabel(canvas, 'Face', faceRect.topCenter, labelStyle);
 
-    // Document guide (rounded rect) on right-lower side.
+    final docW = size.width * 0.82;
+    final docH = size.height * 0.18;
+    var docCenterY = faceRect.bottom + size.height * gap + docH / 2;
+    // Keep ID guide in the lower half of the preview.
+    docCenterY = math.max(docCenterY, size.height * 0.58);
+
     final docRect = Rect.fromCenter(
-      center: Offset(size.width * 0.72, size.height * 0.62),
-      width: size.width * 0.48,
-      height: size.height * 0.26,
+      center: Offset(
+        size.width / 2,
+        docCenterY.clamp(docH / 2, size.height - docH / 2),
+      ),
+      width: docW,
+      height: docH,
     );
     canvas.drawRRect(
       RRect.fromRectAndRadius(docRect, const Radius.circular(14)),
       paint,
+    );
+    _drawLabel(canvas, 'ID card', docRect.topCenter, labelStyle);
+  }
+
+  void _drawLabel(
+    Canvas canvas,
+    String text,
+    Offset anchor,
+    TextStyle style,
+  ) {
+    final tp = TextPainter(
+      text: TextSpan(text: text, style: style),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(
+      canvas,
+      Offset(anchor.dx - tp.width / 2, anchor.dy - tp.height - 6),
     );
   }
 
