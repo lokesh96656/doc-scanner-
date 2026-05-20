@@ -7,6 +7,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
@@ -267,8 +268,9 @@ class _JsonExtractRule {
     final m = re.firstMatch(text);
     if (m == null) return null;
     String? v = m.group(group);
-    if ((v == null || v.isEmpty) && fallbackGroup != null)
+    if ((v == null || v.isEmpty) && fallbackGroup != null) {
       v = m.group(fallbackGroup!);
+    }
     if (v == null) return null;
     if (normalize == 'spaces_remove') {
       v = v.replaceAll(RegExp(r'\s+'), '');
@@ -277,6 +279,19 @@ class _JsonExtractRule {
     }
     return v;
   }
+}
+
+/// Returned from [_CropDocumentScreen]: cropped file, retake raw capture, or cancel.
+class _CropScreenResult {
+  const _CropScreenResult({this.croppedFile, this.retakePhoto = false});
+
+  final File? croppedFile;
+  final bool retakePhoto;
+}
+
+enum _StartFlowMode {
+  twoStep,
+  selfieWithDocument,
 }
 
 class _CropDocumentScreen extends StatefulWidget {
@@ -763,17 +778,31 @@ class _CropDocumentScreenState extends State<_CropDocumentScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => Navigator.of(context).pop<_CropScreenResult?>(null),
+        ),
         title: const Text('Match card corners'),
         actions: [
           TextButton(
+            onPressed: () => Navigator.of(context)
+                .pop(const _CropScreenResult(retakePhoto: true)),
+            child: const Text('Retake photo'),
+          ),
+          TextButton(
             onPressed: () async {
               if (_viewSize == null || _corners == null) {
-                Navigator.of(context).pop<File?>(null);
+                Navigator.of(context).pop<_CropScreenResult?>(null);
                 return;
               }
               final cropped = await _cropAndEnhance();
               if (!context.mounted) return;
-              Navigator.of(context).pop<File?>(cropped);
+              if (cropped == null) {
+                Navigator.of(context).pop<_CropScreenResult?>(null);
+                return;
+              }
+              Navigator.of(context)
+                  .pop(_CropScreenResult(croppedFile: cropped));
             },
             child: const Text('Done'),
           ),
@@ -1147,6 +1176,10 @@ class _MyHomePageState extends State<MyHomePage> {
   String _processingMessage = '';
   XFile? _imageFile;
   XFile? _selfieFile;
+  // Only used in "Selfie + ID" flow: the original photo that contains both
+  // the user's face and the document. `_selfieFile` is then a cropped face
+  // preview for the UI.
+  XFile? _selfieWithDocFile;
   String? _detectedDocumentNumber;
   double? _matchPercent;
   bool? _isDocumentNumberMatch;
@@ -1154,7 +1187,10 @@ class _MyHomePageState extends State<MyHomePage> {
   double? _faceMatchPercent;
   bool? _isFaceMatchPass;
   String? _faceMatchError;
+  // Kept for potential future UI/debug use.
   bool _faceUsedEmbeddingModel = false;
+
+  _StartFlowMode? _flowMode;
 
   Map<String, String> _extractedFields = const {};
   String _detectedTemplateText = 'Unknown';
@@ -1219,7 +1255,7 @@ class _MyHomePageState extends State<MyHomePage> {
     final detected = _detectedDocumentNumber?.trim() ?? '';
 
     if (expected.isEmpty || detected.isEmpty) {
-      setState(() {
+    setState(() {
         _matchPercent = null;
         _isDocumentNumberMatch = null;
       });
@@ -1272,54 +1308,51 @@ class _MyHomePageState extends State<MyHomePage> {
     return 1.0 - distance / maxLen;
   }
 
-  Future<void> _scanDocument() async {
-    try {
-      final String? capturedPath = await Navigator.of(context).push<String?>(
-        MaterialPageRoute(builder: (_) => const _AutoCaptureCameraScreen()),
-      );
-      if (!mounted) return;
+  Future<String?> _captureDocumentPhoto() async {
+    return Navigator.of(context).push<String?>(
+      MaterialPageRoute(builder: (_) => const _AutoCaptureCameraScreen()),
+    );
+  }
 
-      if (capturedPath == null) {
-        return;
-      }
-      final pickedFile = XFile(capturedPath);
-
-      final File? croppedFile = await Navigator.of(context).push<File?>(
+  Future<File?> _cropDocumentPhoto(String rawPath) async {
+    while (mounted) {
+      final result = await Navigator.of(context).push<_CropScreenResult?>(
         MaterialPageRoute(
-          builder: (_) => _CropDocumentScreen(imagePath: pickedFile.path),
+          builder: (_) => _CropDocumentScreen(imagePath: rawPath),
         ),
       );
-      if (!mounted) return;
-
-      if (croppedFile == null) {
-        return;
+      if (!mounted) return null;
+      if (result == null) return null;
+      if (result.retakePhoto) {
+        final again = await _captureDocumentPhoto();
+        if (!mounted) return null;
+        if (again == null) return null;
+        rawPath = again;
+        continue;
       }
+      return result.croppedFile;
+    }
+    return null;
+  }
 
-      final String? selfiePath = await Navigator.of(context).push<String?>(
-        MaterialPageRoute(builder: (_) => const _SelfieCaptureScreen()),
-      );
-      if (!mounted) return;
+  Future<String?> _captureSelfiePhoto() async {
+    return Navigator.of(context).push<String?>(
+      MaterialPageRoute(builder: (_) => const _SelfieCaptureScreen()),
+    );
+  }
 
-      if (selfiePath == null) {
-        return;
-      }
+  Future<void> _processCapturedImages({
+    required String idPath,
+    required String selfiePath,
+  }) async {
+    setState(() {
+      _isProcessing = true;
+      _processingMessage = 'Running OCR and face match…';
+      _imageFile = XFile(idPath);
+      _selfieFile = XFile(selfiePath);
+    });
 
-      setState(() {
-        _isProcessing = true;
-        _processingMessage = 'Running OCR and face match…';
-        _recognizedText = '';
-        _detectedDocumentNumber = null;
-        _matchPercent = null;
-        _isDocumentNumberMatch = null;
-        _faceMatchPercent = null;
-        _isFaceMatchPass = null;
-        _faceMatchError = null;
-        _faceUsedEmbeddingModel = false;
-        _imageFile = XFile(croppedFile.path);
-        _selfieFile = XFile(selfiePath);
-      });
-
-      final idPath = croppedFile.path;
+    try {
       final results = await Future.wait<Object?>([
         _textRecognizer.processImage(InputImage.fromFilePath(idPath)),
         _faceMatchService.compare(
@@ -1353,6 +1386,490 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  Future<void> _scanDocument() async {
+    try {
+      _flowMode = _StartFlowMode.twoStep;
+      final rawPath = await _captureDocumentPhoto();
+      if (!mounted || rawPath == null) return;
+
+      final croppedFile = await _cropDocumentPhoto(rawPath);
+      if (!mounted || croppedFile == null) return;
+
+      final selfiePath = await _captureSelfiePhoto();
+      if (!mounted || selfiePath == null) return;
+
+      setState(() {
+        _recognizedText = '';
+        _detectedDocumentNumber = null;
+        _matchPercent = null;
+        _isDocumentNumberMatch = null;
+        _faceMatchPercent = null;
+        _isFaceMatchPass = null;
+        _faceMatchError = null;
+        _faceUsedEmbeddingModel = false;
+      });
+
+      await _processCapturedImages(
+        idPath: croppedFile.path,
+        selfiePath: selfiePath,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isProcessing = false;
+        _processingMessage = '';
+        _recognizedText = 'Error: $e';
+      });
+    }
+  }
+
+  Future<void> _scanSelfieWithDocument() async {
+    try {
+      _flowMode = _StartFlowMode.selfieWithDocument;
+
+      final combinedPath = await Navigator.of(context).push<String?>(
+        MaterialPageRoute(builder: (_) => const _SelfieWithDocumentCaptureScreen()),
+      );
+      if (!mounted || combinedPath == null) return;
+
+      // Auto-crop ONLY the document out of the combined selfie+doc photo.
+      final croppedDoc = await _autoCropDocumentFromPhoto(combinedPath);
+      if (!mounted || croppedDoc == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Could not detect the document automatically. Please retake with the full card visible and closer to the camera.',
+            ),
+          ),
+        );
+        return;
+      }
+
+      setState(() {
+        _recognizedText = '';
+        _detectedDocumentNumber = null;
+        _matchPercent = null;
+        _isDocumentNumberMatch = null;
+        _faceMatchPercent = null;
+        _isFaceMatchPass = null;
+        _faceMatchError = null;
+        _faceUsedEmbeddingModel = false;
+      });
+
+      await _processSelfieWithDocument(
+        combinedPath: combinedPath,
+        croppedDocPath: croppedDoc.path,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isProcessing = false;
+        _processingMessage = '';
+        _recognizedText = 'Error: $e';
+      });
+    }
+  }
+
+  Future<File?> _autoCropDocumentFromPhoto(String imagePath) async {
+    try {
+      final bytes = await File(imagePath).readAsBytes();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) return null;
+
+      // 1) Prefer OCR-text-based detection (works well when card text is readable).
+      (int, int, int, int)? rect;
+      try {
+        final rt =
+            await _textRecognizer.processImage(InputImage.fromFilePath(imagePath));
+        rect = _docRectFromOcrBlocks(rt, decoded.width, decoded.height);
+      } catch (_) {
+        rect = null;
+      }
+
+      // 2) Fallback to edge-based heuristic.
+      rect ??= _autoDetectDocumentRect(decoded);
+      if (rect == null) return null;
+      final (left, top, right, bottom) = rect;
+
+      final cropped = img.copyCrop(
+        decoded,
+        x: left,
+        y: top,
+        width: (right - left).clamp(1, decoded.width),
+        height: (bottom - top).clamp(1, decoded.height),
+      );
+
+      final gray = img.grayscale(cropped);
+      final enhanced = img.adjustColor(gray, contrast: 1.2);
+
+      final dir = await getTemporaryDirectory();
+      final outPath =
+          '${dir.path}/doc_auto_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final outFile = File(outPath);
+      await outFile.writeAsBytes(img.encodeJpg(enhanced, quality: 90));
+      return outFile;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  (int, int, int, int)? _docRectFromOcrBlocks(
+    RecognizedText rt,
+    int imgW,
+    int imgH,
+  ) {
+    final blocks = rt.blocks;
+    if (blocks.isEmpty) return null;
+
+    // Score blocks that are more likely to belong to the ID card region.
+    final scored = <TextBlock, double>{};
+    for (final b in blocks) {
+      final bb = b.boundingBox;
+      final area = (bb.width * bb.height).abs();
+      if (area < 250) continue;
+      final cx = bb.left + bb.width / 2;
+      final cy = bb.top + bb.height / 2;
+      final nx = cx / imgW;
+      final ny = cy / imgH;
+
+      // In selfie+ID photo, card is usually in lower-right; bias toward that,
+      // but still allow other positions.
+      final bias = (0.6 * nx + 0.4 * ny);
+      scored[b] = area * (0.6 + bias);
+    }
+    if (scored.isEmpty) return null;
+
+    // Use top-N blocks to form a rectangle.
+    final topBlocks = scored.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final takeN = math.min(16, topBlocks.length);
+
+    var minX = double.infinity;
+    var minY = double.infinity;
+    var maxX = -double.infinity;
+    var maxY = -double.infinity;
+
+    for (var i = 0; i < takeN; i++) {
+      final b = topBlocks[i].key;
+      final pts = b.cornerPoints;
+      if (pts.isNotEmpty) {
+        for (final p in pts) {
+          minX = math.min(minX, p.x.toDouble());
+          minY = math.min(minY, p.y.toDouble());
+          maxX = math.max(maxX, p.x.toDouble());
+          maxY = math.max(maxY, p.y.toDouble());
+        }
+      } else {
+        final bb = b.boundingBox;
+        minX = math.min(minX, bb.left);
+        minY = math.min(minY, bb.top);
+        maxX = math.max(maxX, bb.right);
+        maxY = math.max(maxY, bb.bottom);
+      }
+    }
+
+    if (!minX.isFinite ||
+        !minY.isFinite ||
+        !maxX.isFinite ||
+        !maxY.isFinite) {
+      return null;
+    }
+
+    // Expand around text to approximate full card bounds.
+    final padX = (0.35 * (maxX - minX)).clamp(24.0, imgW.toDouble());
+    final padY = (0.55 * (maxY - minY)).clamp(24.0, imgH.toDouble());
+
+    var left = (minX - padX).floor();
+    var right = (maxX + padX).ceil();
+    var top = (minY - padY).floor();
+    var bottom = (maxY + padY).ceil();
+
+    left = left.clamp(0, imgW - 2);
+    right = right.clamp(left + 1, imgW - 1);
+    top = top.clamp(0, imgH - 2);
+    bottom = bottom.clamp(top + 1, imgH - 1);
+
+    final boxW = (right - left).toDouble();
+    final boxH = (bottom - top).toDouble();
+    final areaRatio = (boxW * boxH) / (imgW * imgH);
+    final aspect = boxW / boxH;
+
+    // Be more permissive here because card can be smaller in-frame.
+    if (areaRatio < 0.04 || areaRatio > 0.92) return null;
+    if (aspect < 0.6 || aspect > 3.2) return null;
+
+    return (left, top, right, bottom);
+  }
+
+  /// Heuristic auto-detection of an ID-card-like rectangle in a photo.
+  ///
+  /// Returns (left, top, right, bottom) in *original* image pixels.
+  /// Works best when the document occupies a meaningful portion of the frame.
+  (int, int, int, int)? _autoDetectDocumentRect(img.Image original) {
+    // Downscale for speed and to smooth noise.
+    final targetW = 360;
+    final scale = targetW / original.width;
+    final small = img.copyResize(
+      original,
+      width: targetW,
+      height: (original.height * scale).round().clamp(1, 5000),
+      interpolation: img.Interpolation.linear,
+    );
+
+    final w = small.width;
+    final h = small.height;
+
+    // Compute simple edge magnitude per pixel using grayscale gradients.
+    final gray = img.grayscale(small);
+    final rowEdge = List<double>.filled(h, 0);
+    final colEdge = List<double>.filled(w, 0);
+
+    for (var y = 1; y < h - 1; y++) {
+      for (var x = 1; x < w - 1; x++) {
+        final c = gray.getPixel(x, y).r.toDouble();
+        final dx = (gray.getPixel(x + 1, y).r.toDouble() -
+                gray.getPixel(x - 1, y).r.toDouble())
+            .abs();
+        final dy = (gray.getPixel(x, y + 1).r.toDouble() -
+                gray.getPixel(x, y - 1).r.toDouble())
+            .abs();
+        // A touch of center weighting reduces picking frame borders.
+        final cx = (x - w / 2).abs() / (w / 2);
+        final cy = (y - h / 2).abs() / (h / 2);
+        final weight = 1.0 - (0.25 * (cx + cy)).clamp(0.0, 0.5);
+        final e = (dx + dy) * weight + (c * 0); // keep as double, no-op term
+
+        rowEdge[y] += e;
+        colEdge[x] += e;
+      }
+    }
+
+    int argMax(List<double> v) {
+      var bestI = 0;
+      var best = -1.0;
+      for (var i = 0; i < v.length; i++) {
+        if (v[i] > best) {
+          best = v[i];
+          bestI = i;
+        }
+      }
+      return bestI;
+    }
+
+    // Initial edges are max projections.
+    var top = argMax(rowEdge.sublist(0, (h * 0.6).round().clamp(2, h)));
+    var bottom = argMax(rowEdge
+            .sublist((h * 0.4).round().clamp(0, h - 2), h - 1)) +
+        (h * 0.4).round().clamp(0, h - 2);
+    var left = argMax(colEdge.sublist(0, (w * 0.6).round().clamp(2, w)));
+    var right = argMax(colEdge
+            .sublist((w * 0.4).round().clamp(0, w - 2), w - 1)) +
+        (w * 0.4).round().clamp(0, w - 2);
+
+    // Expand a little to include borders.
+    final padX = (0.03 * w).round();
+    final padY = (0.03 * h).round();
+    left = (left - padX).clamp(0, w - 2);
+    right = (right + padX).clamp(left + 1, w - 1);
+    top = (top - padY).clamp(0, h - 2);
+    bottom = (bottom + padY).clamp(top + 1, h - 1);
+
+    final boxW = (right - left).toDouble();
+    final boxH = (bottom - top).toDouble();
+    if (boxW <= 0 || boxH <= 0) return null;
+
+    final areaRatio = (boxW * boxH) / (w * h);
+    final aspect = boxW / boxH;
+    // Typical ID card aspect ~1.4–1.7; allow wider range for perspective.
+    if (areaRatio < 0.08 || areaRatio > 0.92) return null;
+    if (aspect < 0.6 || aspect > 3.2) return null;
+
+    // Scale back to original coordinates.
+    final inv = 1 / scale;
+    final oLeft = (left * inv).round().clamp(0, original.width - 2);
+    final oRight = (right * inv).round().clamp(oLeft + 1, original.width - 1);
+    final oTop = (top * inv).round().clamp(0, original.height - 2);
+    final oBottom =
+        (bottom * inv).round().clamp(oTop + 1, original.height - 1);
+
+    return (oLeft, oTop, oRight, oBottom);
+  }
+
+  Future<void> _processSelfieWithDocument({
+    required String combinedPath,
+    required String croppedDocPath,
+  }) async {
+    final selfiePreview = await _autoCropSelfieFacePreview(combinedPath);
+
+    setState(() {
+      _isProcessing = true;
+      _processingMessage = 'Running OCR and face match…';
+      _imageFile = XFile(croppedDocPath);
+      _selfieWithDocFile = XFile(combinedPath);
+      _selfieFile = selfiePreview != null ? XFile(selfiePreview.path) : null;
+    });
+
+    try {
+      final results = await Future.wait<Object?>([
+        _textRecognizer.processImage(InputImage.fromFilePath(croppedDocPath)),
+        _faceMatchService.compareSelfieWithDocument(
+          combinedSelfieWithDocPath: combinedPath,
+          croppedDocumentPath: croppedDocPath,
+        ),
+      ]);
+
+      if (!mounted) return;
+
+      final recognizedText = results[0] as RecognizedText;
+      final faceResult = results[1] as FaceMatchResult;
+
+      setState(() {
+        _recognizedText = recognizedText.text;
+        _isProcessing = false;
+        _processingMessage = '';
+        _faceMatchPercent = faceResult.matchPercent;
+        _isFaceMatchPass = faceResult.pass;
+        _faceMatchError = faceResult.error;
+        _faceUsedEmbeddingModel = faceResult.usedEmbeddingModel;
+      });
+      _runTemplatePipeline(recognizedText.text);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isProcessing = false;
+        _processingMessage = '';
+        _recognizedText = 'Error: $e';
+      });
+    }
+  }
+
+  Future<File?> _autoCropSelfieFacePreview(String combinedPath) async {
+    try {
+      final detector = FaceDetector(
+        options: FaceDetectorOptions(
+          performanceMode: FaceDetectorMode.fast,
+          minFaceSize: 0.12,
+        ),
+      );
+      final faces = await detector.processImage(
+        InputImage.fromFilePath(combinedPath),
+      );
+      detector.close();
+      if (faces.isEmpty) return null;
+
+      Face best = faces.first;
+      var bestArea = 0.0;
+      for (final f in faces) {
+        final a = f.boundingBox.width * f.boundingBox.height;
+        if (a > bestArea) {
+          bestArea = a;
+          best = f;
+        }
+      }
+
+      final bytes = await File(combinedPath).readAsBytes();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) return null;
+
+      final box = best.boundingBox;
+      final padX = box.width * 0.25;
+      final padY = box.height * 0.30;
+      var left = (box.left - padX).floor();
+      var top = (box.top - padY).floor();
+      var right = (box.right + padX).ceil();
+      var bottom = (box.bottom + padY).ceil();
+
+      left = left.clamp(0, decoded.width - 1);
+      top = top.clamp(0, decoded.height - 1);
+      right = right.clamp(left + 1, decoded.width);
+      bottom = bottom.clamp(top + 1, decoded.height);
+
+      final crop = img.copyCrop(
+        decoded,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+      );
+
+      final resized = img.copyResize(crop, width: 320);
+      final dir = await getTemporaryDirectory();
+      final outPath =
+          '${dir.path}/selfie_face_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final outFile = File(outPath);
+      await outFile.writeAsBytes(img.encodeJpg(resized, quality: 90));
+      return outFile;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _changeDocument() async {
+    if (_isProcessing) return;
+
+    if (_flowMode == _StartFlowMode.selfieWithDocument) {
+      final combined = _selfieWithDocFile?.path;
+      if (combined == null) {
+        await _scanSelfieWithDocument();
+        return;
+      }
+      final croppedDoc = await _autoCropDocumentFromPhoto(combined);
+      if (!mounted || croppedDoc == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Could not detect the document automatically. Please retake the photo.',
+            ),
+          ),
+        );
+        return;
+      }
+      await _processSelfieWithDocument(
+        combinedPath: combined,
+        croppedDocPath: croppedDoc.path,
+      );
+      return;
+    }
+
+    final rawPath = await _captureDocumentPhoto();
+    if (!mounted || rawPath == null) return;
+
+    final croppedFile = await _cropDocumentPhoto(rawPath);
+    if (!mounted || croppedFile == null) return;
+
+    final selfiePath = _selfieFile?.path;
+    if (selfiePath != null) {
+      await _processCapturedImages(
+        idPath: croppedFile.path,
+        selfiePath: selfiePath,
+      );
+    } else {
+      setState(() => _imageFile = XFile(croppedFile.path));
+    }
+  }
+
+  Future<void> _changeSelfie() async {
+    if (_isProcessing) return;
+
+    if (_flowMode == _StartFlowMode.selfieWithDocument) {
+      await _scanSelfieWithDocument();
+      return;
+    }
+
+    final idPath = _imageFile?.path;
+    if (idPath == null) {
+      await _scanDocument();
+      return;
+    }
+
+    final selfiePath = await _captureSelfiePhoto();
+    if (!mounted || selfiePath == null) return;
+
+    await _processCapturedImages(idPath: idPath, selfiePath: selfiePath);
+  }
+
   void _runTemplatePipeline(String ocrText) {
     final engine = _jsonTemplates;
     if (engine == null) {
@@ -1377,14 +1894,30 @@ class _MyHomePageState extends State<MyHomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('OCR Document Scanner')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            ElevatedButton.icon(
-              icon: const Icon(Icons.camera_alt),
-              label: const Text('Scan Document'),
-              onPressed: _isProcessing ? null : _scanDocument,
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.document_scanner),
+                    label: const Text('Scan ID'),
+                    onPressed: _isProcessing ? null : _scanDocument,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.face),
+                    label: const Text('Selfie + ID'),
+                    onPressed: _isProcessing ? null : _scanSelfieWithDocument,
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 16),
             if (_isProcessing) ...[
@@ -1394,8 +1927,41 @@ class _MyHomePageState extends State<MyHomePage> {
                 Text(_processingMessage),
               ],
             ],
+            if ((_imageFile != null || _selfieFile != null) && !_isProcessing) ...[
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  if (_imageFile != null)
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _changeDocument,
+                        icon: const Icon(Icons.badge_outlined),
+                        label: const Text('Change document'),
+                      ),
+                    ),
+                  if (_imageFile != null && _selfieFile != null)
+                    const SizedBox(width: 8),
+                  if (_selfieFile != null)
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _changeSelfie,
+                        icon: const Icon(Icons.face_retouching_natural),
+                        label: const Text('Change selfie'),
+                      ),
+                    ),
+                ],
+              ),
+            ],
             if (_imageFile != null && !_isProcessing) ...[
-              const SizedBox(height: 16),
+              const SizedBox(height: 12),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Document',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+              const SizedBox(height: 4),
               SizedBox(height: 160, child: Image.file(File(_imageFile!.path))),
             ],
             if (_selfieFile != null && !_isProcessing) ...[
@@ -1506,32 +2072,31 @@ class _MyHomePageState extends State<MyHomePage> {
                         color: _isFaceMatchPass! ? Colors.green : Colors.red,
                       ),
                     ),
+                    Text(
+                      _faceUsedEmbeddingModel
+                          ? 'Model: MobileFaceNet'
+                          : 'Model: Not loaded',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
                   ],
                 ),
               ),
             const SizedBox(height: 16),
-            Expanded(
-              child: SingleChildScrollView(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Extracted text from document',
-                      style: TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                    const SizedBox(height: 8),
-                    SelectableText(
-                      _recognizedText.isEmpty
-                          ? 'Captured text will appear here.'
-                          : _recognizedText,
-                    ),
-                  ],
-                ),
-              ),
+            const Text(
+              'Extracted text from document',
+              style: TextStyle(fontWeight: FontWeight.w600),
             ),
+            const SizedBox(height: 8),
+            SelectableText(
+              _recognizedText.isEmpty
+                  ? 'Captured text will appear here.'
+                  : _recognizedText,
+            ),
+            const SizedBox(height: 24),
           ],
         ),
       ),
+    ),
     );
   }
 }
@@ -1543,10 +2108,211 @@ class _SelfieCaptureScreen extends StatefulWidget {
   State<_SelfieCaptureScreen> createState() => _SelfieCaptureScreenState();
 }
 
+/// Front-camera capture where user holds the ID next to their face.
+/// Returns a single image path containing both face + document.
+class _SelfieWithDocumentCaptureScreen extends StatefulWidget {
+  const _SelfieWithDocumentCaptureScreen();
+
+  @override
+  State<_SelfieWithDocumentCaptureScreen> createState() =>
+      _SelfieWithDocumentCaptureScreenState();
+}
+
+class _SelfieWithDocumentCaptureScreenState
+    extends State<_SelfieWithDocumentCaptureScreen> {
+  CameraController? _controller;
+  bool _isInitializing = true;
+  bool _isCapturing = false;
+  String? _previewPath;
+
+  @override
+  void initState() {
+    super.initState();
+    _initCamera();
+  }
+
+  Future<void> _initCamera() async {
+    try {
+      final cameras = await availableCameras();
+      final front = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.front,
+        orElse: () => cameras.first,
+      );
+      final controller = CameraController(
+        front,
+        ResolutionPreset.high,
+        enableAudio: false,
+      );
+      await controller.initialize();
+      if (!mounted) return;
+      setState(() {
+        _controller = controller;
+        _isInitializing = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      Navigator.of(context).pop<String?>(null);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _capture() async {
+    if (_isCapturing) return;
+    setState(() => _isCapturing = true);
+    try {
+      final c = _controller;
+      if (c == null || !c.value.isInitialized) return;
+      final file = await c.takePicture();
+      if (!mounted) return;
+      setState(() {
+        _previewPath = file.path;
+        _isCapturing = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isCapturing = false);
+    }
+  }
+
+  void _retake() {
+    setState(() => _previewPath = null);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = _controller;
+    final preview = _previewPath;
+
+    return Scaffold(
+      appBar: AppBar(
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => Navigator.of(context).pop<String?>(null),
+        ),
+        title: Text(preview == null ? 'Selfie with ID' : 'Review'),
+      ),
+      body: _isInitializing || c == null
+          ? const Center(child: CircularProgressIndicator())
+          : preview != null
+              ? Column(
+                  children: [
+                    Expanded(
+                      child: Image.file(File(preview), fit: BoxFit.contain),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+        child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+                          FilledButton(
+                            onPressed: () => Navigator.of(context).pop(preview),
+                            child: const Text('Use this photo'),
+                          ),
+                          const SizedBox(height: 8),
+                          OutlinedButton.icon(
+                            onPressed: _retake,
+                            icon: const Icon(Icons.refresh),
+                            label: const Text('Retake'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                )
+              : Stack(
+                  children: [
+                    Positioned.fill(child: CameraPreview(c)),
+                    Positioned.fill(
+                      child: IgnorePointer(
+                        child: CustomPaint(
+                          painter: _SelfieWithDocumentOverlayPainter(
+                            color: Colors.white.withValues(alpha: 0.9),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: 16,
+                      right: 16,
+                      bottom: 24,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.55),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: const Text(
+                              'Hold your ID next to your face. Make sure the card text is readable and avoid glare.',
+                              style: TextStyle(color: Colors.white),
+                              textAlign: TextAlign.center,
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          FilledButton.icon(
+                            onPressed: _isCapturing ? null : _capture,
+                            icon: const Icon(Icons.camera_alt),
+                            label: Text(_isCapturing ? 'Capturing…' : 'Capture'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+    );
+  }
+}
+
+class _SelfieWithDocumentOverlayPainter extends CustomPainter {
+  _SelfieWithDocumentOverlayPainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0;
+
+    // Face guide (oval) on left side.
+    final faceRect = Rect.fromCenter(
+      center: Offset(size.width * 0.33, size.height * 0.42),
+      width: size.width * 0.45,
+      height: size.height * 0.38,
+    );
+    canvas.drawOval(faceRect, paint);
+
+    // Document guide (rounded rect) on right-lower side.
+    final docRect = Rect.fromCenter(
+      center: Offset(size.width * 0.72, size.height * 0.62),
+      width: size.width * 0.48,
+      height: size.height * 0.26,
+    );
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(docRect, const Radius.circular(14)),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _SelfieWithDocumentOverlayPainter oldDelegate) {
+    return oldDelegate.color != color;
+  }
+}
+
 class _SelfieCaptureScreenState extends State<_SelfieCaptureScreen> {
   CameraController? _controller;
   bool _isInitializing = true;
   bool _isCapturing = false;
+  String? _previewPath;
 
   @override
   void initState() {
@@ -1592,20 +2358,61 @@ class _SelfieCaptureScreenState extends State<_SelfieCaptureScreen> {
       if (c == null || !c.value.isInitialized) return;
       final file = await c.takePicture();
       if (!mounted) return;
-      Navigator.of(context).pop<String>(file.path);
+      setState(() {
+        _previewPath = file.path;
+        _isCapturing = false;
+      });
     } catch (_) {
       if (!mounted) return;
-      Navigator.of(context).pop<String?>(null);
+      setState(() => _isCapturing = false);
     }
+  }
+
+  void _retake() {
+    setState(() => _previewPath = null);
   }
 
   @override
   Widget build(BuildContext context) {
     final c = _controller;
+    final preview = _previewPath;
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Take selfie')),
+      appBar: AppBar(
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => Navigator.of(context).pop<String?>(null),
+        ),
+        title: Text(preview == null ? 'Take selfie' : 'Review selfie'),
+      ),
       body: _isInitializing || c == null
           ? const Center(child: CircularProgressIndicator())
+          : preview != null
+          ? Column(
+              children: [
+                Expanded(
+                  child: Image.file(File(preview), fit: BoxFit.contain),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      FilledButton(
+                        onPressed: () => Navigator.of(context).pop(preview),
+                        child: const Text('Use this selfie'),
+                      ),
+                      const SizedBox(height: 8),
+                      OutlinedButton.icon(
+                        onPressed: _retake,
+                        icon: const Icon(Icons.refresh),
+                        label: const Text('Retake'),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            )
           : Stack(
               children: [
                 Positioned.fill(child: CameraPreview(c)),
@@ -1657,6 +2464,7 @@ class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
   CameraController? _controller;
   bool _isInitializing = true;
   bool _isCapturing = false;
+  String? _previewPath;
 
   // Stability/blur checks
   List<int>? _prevLuma; // small grayscale sample
@@ -1769,36 +2577,91 @@ class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
   }
 
   Future<void> _capture() async {
-    if (_isCapturing) return;
+    if (_isCapturing || _previewPath != null) return;
     setState(() => _isCapturing = true);
     try {
       final c = _controller;
       if (c == null) return;
-      await c.stopImageStream();
+      try {
+        await c.stopImageStream();
+      } catch (_) {}
       final file = await c.takePicture();
       if (!mounted) return;
-      Navigator.of(context).pop<String>(file.path);
+      setState(() {
+        _previewPath = file.path;
+        _isCapturing = false;
+        _stableFrames = 0;
+        _prevLuma = null;
+      });
     } catch (_) {
       if (!mounted) return;
-      Navigator.of(context).pop<String?>(null);
+      setState(() => _isCapturing = false);
+    }
+  }
+
+  Future<void> _retake() async {
+    setState(() {
+      _previewPath = null;
+      _stableFrames = 0;
+      _prevLuma = null;
+    });
+    final c = _controller;
+    if (c != null && c.value.isInitialized) {
+      try {
+        await c.startImageStream(_onFrame);
+      } catch (_) {}
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final c = _controller;
+    final preview = _previewPath;
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Auto Capture'),
-        actions: [
-          TextButton(
-            onPressed: _isCapturing ? null : _capture,
-            child: const Text('Capture now'),
-          ),
-        ],
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => Navigator.of(context).pop<String?>(null),
+        ),
+        title: Text(preview == null ? 'Scan document' : 'Review document'),
+        actions: preview == null
+            ? [
+                TextButton(
+                  onPressed: _isCapturing ? null : _capture,
+                  child: const Text('Capture now'),
+                ),
+              ]
+            : null,
       ),
       body: _isInitializing || c == null
           ? const Center(child: CircularProgressIndicator())
+          : preview != null
+          ? Column(
+              children: [
+                Expanded(
+                  child: Image.file(File(preview), fit: BoxFit.contain),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      FilledButton(
+                        onPressed: () => Navigator.of(context).pop(preview),
+                        child: const Text('Use this photo'),
+                      ),
+                      const SizedBox(height: 8),
+                      OutlinedButton.icon(
+                        onPressed: _retake,
+                        icon: const Icon(Icons.refresh),
+                        label: const Text('Retake'),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            )
           : Stack(
               children: [
                 Positioned.fill(child: CameraPreview(c)),
@@ -1818,20 +2681,20 @@ class _AutoCaptureCameraScreenState extends State<_AutoCaptureCameraScreen> {
                         mainAxisSize: MainAxisSize.min,
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
+            Text(
                             _isCapturing
                                 ? 'Capturing...'
                                 : (_stableFrames >= _neededStableFrames
                                       ? 'Captured'
                                       : 'Hold steady…'),
-                          ),
-                        ],
-                      ),
-                    ),
+            ),
+          ],
+        ),
+      ),
                   ),
                 ),
               ],
-            ),
+      ),
     );
   }
 }

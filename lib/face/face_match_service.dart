@@ -73,6 +73,35 @@ class FaceMatchService {
     required String idImagePath,
     required String selfieImagePath,
   }) async {
+    return _compareInternal(
+      idImagePath: idImagePath,
+      selfieImagePath: selfieImagePath,
+      allowMultipleFacesInSelfie: false,
+    );
+  }
+
+  /// Used for "selfie with document" mode:
+  /// - `selfieImagePath`: the combined photo (face + document)
+  /// - `idImagePath`: the cropped document image (after perspective warp)
+  ///
+  /// We select the *largest* face in the combined photo as the selfie face,
+  /// and compare it with the face detected on the cropped document.
+  Future<FaceMatchResult> compareSelfieWithDocument({
+    required String combinedSelfieWithDocPath,
+    required String croppedDocumentPath,
+  }) async {
+    return _compareInternal(
+      idImagePath: croppedDocumentPath,
+      selfieImagePath: combinedSelfieWithDocPath,
+      allowMultipleFacesInSelfie: true,
+    );
+  }
+
+  Future<FaceMatchResult> _compareInternal({
+    required String idImagePath,
+    required String selfieImagePath,
+    required bool allowMultipleFacesInSelfie,
+  }) async {
     await init();
     final detector = _detector;
     if (detector == null) {
@@ -111,14 +140,14 @@ class FaceMatchService {
           error: 'No face found in selfie. Please retake facing the camera.',
         );
       }
-      if (selfieFaces.length > 1) {
+      if (!allowMultipleFacesInSelfie && selfieFaces.length > 1) {
         return const FaceMatchResult(
           error: 'Multiple faces in selfie. Only one person should be visible.',
         );
       }
 
       final idFace = _largestFace(idFaces);
-      final selfieFace = selfieFaces.first;
+      final selfieFace = _largestFace(selfieFaces);
 
       final idAligned = _prepareAlignedFace(idDecoded, idFace);
       final selfieAligned = _prepareAlignedFace(selfieDecoded, selfieFace);
