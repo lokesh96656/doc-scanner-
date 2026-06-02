@@ -1,0 +1,4 @@
+enum ScanFlowMode {
+  twoStep,
+  selfieWithDocument,
+}
