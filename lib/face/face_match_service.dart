@@ -1,10 +1,13 @@
-import 'dart:io';
 import 'dart:math' as math;
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
 
-/// On-device face comparison: ML Kit detection + MobileFaceNet embeddings.
+import 'face_aligner.dart';
+import 'face_image_utils.dart';
+import 'face_quality.dart';
+
+/// On-device face comparison: ML Kit + 5-point alignment + MobileFaceNet embeddings.
 class FaceMatchResult {
   const FaceMatchResult({
     this.matchPercent,
@@ -12,6 +15,7 @@ class FaceMatchResult {
     this.error,
     this.usedEmbeddingModel = false,
     this.distance,
+    this.cosineSimilarity,
   });
 
   final double? matchPercent;
@@ -22,11 +26,17 @@ class FaceMatchResult {
   /// L2 distance between embeddings (lower = more similar). For debugging/tuning.
   final double? distance;
 
-  /// Same-person if Euclidean distance on normalized embeddings is below this.
-  static const double matchDistanceThreshold = 1.0;
+  /// Cosine similarity on L2-normalized embeddings (higher = more similar).
+  final double? cosineSimilarity;
 
-  /// Distances above this are treated as 0% match in the UI scale.
-  static const double displayMaxDistance = 1.6;
+  /// Same-person if cosine similarity is at or above this (≈ distance 0.98).
+  static const double matchCosineThreshold = 0.52;
+
+  /// Cosine at or below this maps to ~0% in the UI.
+  static const double displayMinCosine = 0.38;
+
+  /// Cosine at or above this maps to ~100% in the UI.
+  static const double displayMaxCosine = 0.92;
 }
 
 class FaceMatchService {
@@ -41,7 +51,7 @@ class FaceMatchService {
     _detector ??= FaceDetector(
       options: FaceDetectorOptions(
         performanceMode: FaceDetectorMode.accurate,
-        minFaceSize: 0.15,
+        minFaceSize: 0.08,
         enableLandmarks: true,
       ),
     );
@@ -80,12 +90,6 @@ class FaceMatchService {
     );
   }
 
-  /// Used for "selfie with document" mode:
-  /// - `selfieImagePath`: the combined photo (face + document)
-  /// - `idImagePath`: the cropped document image (after perspective warp)
-  ///
-  /// We select the *largest* face in the combined photo as the selfie face,
-  /// and compare it with the face detected on the cropped document.
   Future<FaceMatchResult> compareSelfieWithDocument({
     required String combinedSelfieWithDocPath,
     required String croppedDocumentPath,
@@ -115,10 +119,8 @@ class FaceMatchService {
     }
 
     try {
-      final idBytes = await File(idImagePath).readAsBytes();
-      final selfieBytes = await File(selfieImagePath).readAsBytes();
-      final idDecoded = img.decodeImage(idBytes);
-      final selfieDecoded = img.decodeImage(selfieBytes);
+      final idDecoded = loadOrientedImage(idImagePath);
+      final selfieDecoded = loadOrientedImage(selfieImagePath);
       if (idDecoded == null || selfieDecoded == null) {
         return const FaceMatchResult(error: 'Could not read image files');
       }
@@ -140,120 +142,127 @@ class FaceMatchService {
           error: 'No face found in selfie. Please retake facing the camera.',
         );
       }
-      if (!allowMultipleFacesInSelfie && selfieFaces.length > 1) {
+
+      final idFace = selectPrimaryFace(
+        idFaces,
+        imageWidth: idDecoded.width,
+        imageHeight: idDecoded.height,
+        minAreaRatio: 0.003,
+      );
+      if (idFace == null) {
+        return const FaceMatchResult(
+          error: 'No usable face on ID document.',
+        );
+      }
+
+      final selfieFace = selectPrimaryFace(
+        selfieFaces,
+        imageWidth: selfieDecoded.width,
+        imageHeight: selfieDecoded.height,
+        minAreaRatio: allowMultipleFacesInSelfie ? 0.008 : 0.012,
+      );
+      if (selfieFace == null) {
+        return const FaceMatchResult(
+          error: 'No usable face in selfie photo.',
+        );
+      }
+
+      if (!allowMultipleFacesInSelfie &&
+          shouldRejectExtraFaces(
+            selfieFaces,
+            selfieFace,
+            imageWidth: selfieDecoded.width,
+            imageHeight: selfieDecoded.height,
+          )) {
         return const FaceMatchResult(
           error: 'Multiple faces in selfie. Only one person should be visible.',
         );
       }
 
-      final idFace = _largestFace(idFaces);
-      final selfieFace = _largestFace(selfieFaces);
+      final idQuality = checkFaceQuality(
+        idFace,
+        imageWidth: idDecoded.width,
+        imageHeight: idDecoded.height,
+        decoded: idDecoded,
+        isDocumentPortrait: true,
+      );
+      if (idQuality != null) {
+        return FaceMatchResult(error: idQuality.message);
+      }
 
-      final idAligned = _prepareAlignedFace(idDecoded, idFace);
-      final selfieAligned = _prepareAlignedFace(selfieDecoded, selfieFace);
-      if (idAligned == null || selfieAligned == null) {
-        return const FaceMatchResult(error: 'Could not prepare face images');
+      final selfieQuality = checkFaceQuality(
+        selfieFace,
+        imageWidth: selfieDecoded.width,
+        imageHeight: selfieDecoded.height,
+        decoded: selfieDecoded,
+        isDocumentPortrait: false,
+      );
+      if (selfieQuality != null) {
+        return FaceMatchResult(error: selfieQuality.message);
+      }
+
+      final idAligned = alignFaceTo112(idDecoded, idFace);
+      if (idAligned == null) {
+        return const FaceMatchResult(error: 'Could not align ID portrait');
       }
 
       final idVec = _embedWithTflite(_interpreter!, idAligned);
-      final selfieVec = _embedWithTflite(_interpreter!, selfieAligned);
+      final match = _bestSelfieMatch(
+        interpreter: _interpreter!,
+        idVec: idVec,
+        selfieDecoded: selfieDecoded,
+        selfieFace: selfieFace,
+      );
+      if (match == null) {
+        return const FaceMatchResult(error: 'Could not align selfie face');
+      }
 
-      final distance = _euclideanDistance(idVec, selfieVec);
-      final pass = distance < FaceMatchResult.matchDistanceThreshold;
-      final percent = _distanceToPercent(distance);
+      final pass = match.cosine >= FaceMatchResult.matchCosineThreshold;
+      final percent = _cosineToPercent(match.cosine);
 
       return FaceMatchResult(
         matchPercent: percent,
         pass: pass,
         usedEmbeddingModel: true,
-        distance: distance,
+        distance: match.distance,
+        cosineSimilarity: match.cosine,
       );
     } catch (e) {
       return FaceMatchResult(error: 'Face match failed: $e');
     }
   }
 
-  /// Maps L2 distance to 0–100% for display (calibrated for MobileFaceNet).
-  double _distanceToPercent(double distance) {
-    const maxD = FaceMatchResult.displayMaxDistance;
-    final t = FaceMatchResult.matchDistanceThreshold;
-    if (distance <= 0) return 100;
-    if (distance >= maxD) return 0;
-    // 100% at distance 0, ~50% at threshold, 0% at maxD.
-    if (distance <= t) {
-      return (100 * (1 - distance / (2 * t))).clamp(0.0, 100.0);
-    }
-    return (100 * (1 - distance / maxD)).clamp(0.0, 100.0);
-  }
+  /// Tries normal + horizontally mirrored selfie (front camera mirror fix).
+  _EmbeddingMatch? _bestSelfieMatch({
+    required Interpreter interpreter,
+    required List<double> idVec,
+    required img.Image selfieDecoded,
+    required Face selfieFace,
+  }) {
+    _EmbeddingMatch? best;
 
-  Face _largestFace(List<Face> faces) {
-    Face best = faces.first;
-    var bestArea = 0.0;
-    for (final f in faces) {
-      final box = f.boundingBox;
-      final area = box.width * box.height;
-      if (area > bestArea) {
-        bestArea = area;
-        best = f;
+    void consider(img.Image? aligned) {
+      if (aligned == null) return;
+      final vec = _embedWithTflite(interpreter, aligned);
+      final distance = _euclideanDistance(idVec, vec);
+      final cosine = _cosineSimilarity(idVec, vec);
+      if (best == null || cosine > best!.cosine) {
+        best = _EmbeddingMatch(distance: distance, cosine: cosine);
       }
     }
+
+    consider(alignFaceTo112(selfieDecoded, selfieFace));
+    consider(alignFaceTo112Mirrored(selfieDecoded, selfieFace));
+
     return best;
   }
 
-  /// Crop, rotate using eye landmarks, then resize to model input.
-  img.Image? _prepareAlignedFace(img.Image source, Face face) {
-    final crop = _cropFace(source, face);
-    if (crop == null) return null;
-
-    final leftEye = face.landmarks[FaceLandmarkType.leftEye]?.position;
-    final rightEye = face.landmarks[FaceLandmarkType.rightEye]?.position;
-
-    img.Image work = crop;
-    if (leftEye != null && rightEye != null) {
-      final box = face.boundingBox;
-      final padX = box.width * 0.2;
-      final padY = box.height * 0.25;
-      final cropLeft = (box.left - padX).floor();
-      final cropTop = (box.top - padY).floor();
-
-      final lx = leftEye.x - cropLeft;
-      final ly = leftEye.y - cropTop;
-      final rx = rightEye.x - cropLeft;
-      final ry = rightEye.y - cropTop;
-
-      final angleDeg = math.atan2(ry - ly, rx - lx) * 180 / math.pi;
-      work = img.copyRotate(crop, angle: -angleDeg);
-    }
-
-    return img.copyResize(
-      work,
-      width: _inputSize,
-      height: _inputSize,
-      interpolation: img.Interpolation.linear,
-    );
-  }
-
-  img.Image? _cropFace(img.Image source, Face face) {
-    final box = face.boundingBox;
-    final padX = box.width * 0.25;
-    final padY = box.height * 0.3;
-    var left = (box.left - padX).floor();
-    var top = (box.top - padY).floor();
-    var right = (box.right + padX).ceil();
-    var bottom = (box.bottom + padY).ceil();
-
-    left = left.clamp(0, source.width - 1);
-    top = top.clamp(0, source.height - 1);
-    right = right.clamp(left + 1, source.width);
-    bottom = bottom.clamp(top + 1, source.height);
-
-    return img.copyCrop(
-      source,
-      x: left,
-      y: top,
-      width: right - left,
-      height: bottom - top,
-    );
+  double _cosineToPercent(double cosine) {
+    final low = FaceMatchResult.displayMinCosine;
+    final high = FaceMatchResult.displayMaxCosine;
+    if (cosine >= high) return 100;
+    if (cosine <= low) return 0;
+    return ((cosine - low) / (high - low) * 100).clamp(0.0, 100.0);
   }
 
   List<double> _embedWithTflite(Interpreter interpreter, img.Image face112) {
@@ -288,6 +297,16 @@ class FaceMatchService {
     return v.map((e) => e / norm).toList(growable: false);
   }
 
+  double _cosineSimilarity(List<double> a, List<double> b) {
+    final n = a.length < b.length ? a.length : b.length;
+    if (n == 0) return -1;
+    var dot = 0.0;
+    for (var i = 0; i < n; i++) {
+      dot += a[i] * b[i];
+    }
+    return dot;
+  }
+
   double _euclideanDistance(List<double> a, List<double> b) {
     final n = a.length < b.length ? a.length : b.length;
     if (n == 0) return double.infinity;
@@ -298,4 +317,10 @@ class FaceMatchService {
     }
     return math.sqrt(sum);
   }
+}
+
+class _EmbeddingMatch {
+  const _EmbeddingMatch({required this.distance, required this.cosine});
+  final double distance;
+  final double cosine;
 }

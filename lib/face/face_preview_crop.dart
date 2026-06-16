@@ -4,13 +4,17 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 
+import 'face_image_utils.dart';
+import 'face_quality.dart';
+
 /// Auto-crops the largest face from a combined selfie+document photo for UI preview.
 Future<File?> autoCropSelfieFacePreview(String combinedPath) async {
   try {
     final detector = FaceDetector(
       options: FaceDetectorOptions(
-        performanceMode: FaceDetectorMode.fast,
-        minFaceSize: 0.12,
+        performanceMode: FaceDetectorMode.accurate,
+        minFaceSize: 0.08,
+        enableLandmarks: true,
       ),
     );
     final faces = await detector.processImage(
@@ -19,19 +23,16 @@ Future<File?> autoCropSelfieFacePreview(String combinedPath) async {
     detector.close();
     if (faces.isEmpty) return null;
 
-    Face best = faces.first;
-    var bestArea = 0.0;
-    for (final f in faces) {
-      final a = f.boundingBox.width * f.boundingBox.height;
-      if (a > bestArea) {
-        bestArea = a;
-        best = f;
-      }
-    }
-
-    final bytes = await File(combinedPath).readAsBytes();
-    final decoded = img.decodeImage(bytes);
+    final decoded = loadOrientedImage(combinedPath);
     if (decoded == null) return null;
+
+    final best = selectPrimaryFace(
+      faces,
+      imageWidth: decoded.width,
+      imageHeight: decoded.height,
+      minAreaRatio: 0.008,
+    );
+    if (best == null) return null;
 
     final box = best.boundingBox;
     final padX = box.width * 0.25;

@@ -12,8 +12,11 @@ class SelfieCaptureScreen extends StatefulWidget {
 
 class SelfieCaptureScreenState extends State<SelfieCaptureScreen> {
   CameraController? _controller;
+  List<CameraDescription> _cameras = [];
+  CameraLensDirection _lensDirection = CameraLensDirection.front;
   bool _isInitializing = true;
   bool _isCapturing = false;
+  bool _isSwitchingCamera = false;
   String? _previewPath;
 
   @override
@@ -22,15 +25,27 @@ class SelfieCaptureScreenState extends State<SelfieCaptureScreen> {
     _initCamera();
   }
 
-  Future<void> _initCamera() async {
+  bool get _canSwitchCamera =>
+      _cameras.any((c) => c.lensDirection == CameraLensDirection.front) &&
+      _cameras.any((c) => c.lensDirection == CameraLensDirection.back);
+
+  Future<void> _initCamera({CameraLensDirection? prefer}) async {
+    final target = prefer ?? _lensDirection;
+    if (mounted) {
+      setState(() => _isInitializing = true);
+    }
     try {
-      final cameras = await availableCameras();
-      final front = cameras.firstWhere(
-        (c) => c.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
+      if (_cameras.isEmpty) {
+        _cameras = await availableCameras();
+      }
+      final selected = _cameras.firstWhere(
+        (c) => c.lensDirection == target,
+        orElse: () => _cameras.first,
       );
+
+      await _controller?.dispose();
       final controller = CameraController(
-        front,
+        selected,
         ResolutionPreset.medium,
         enableAudio: false,
       );
@@ -38,12 +53,32 @@ class SelfieCaptureScreenState extends State<SelfieCaptureScreen> {
       if (!mounted) return;
       setState(() {
         _controller = controller;
+        _lensDirection = selected.lensDirection;
         _isInitializing = false;
+        _isSwitchingCamera = false;
       });
     } catch (e) {
       if (!mounted) return;
-      Navigator.of(context).pop<String?>(null);
+      if (_controller == null) {
+        Navigator.of(context).pop<String?>(null);
+        return;
+      }
+      setState(() {
+        _isInitializing = false;
+        _isSwitchingCamera = false;
+      });
     }
+  }
+
+  Future<void> _toggleCamera() async {
+    if (_isCapturing || _isInitializing || _isSwitchingCamera || !_canSwitchCamera) {
+      return;
+    }
+    setState(() => _isSwitchingCamera = true);
+    final next = _lensDirection == CameraLensDirection.front
+        ? CameraLensDirection.back
+        : CameraLensDirection.front;
+    await _initCamera(prefer: next);
   }
 
   @override
@@ -74,10 +109,18 @@ class SelfieCaptureScreenState extends State<SelfieCaptureScreen> {
     setState(() => _previewPath = null);
   }
 
+  String get _captureHint {
+    if (_lensDirection == CameraLensDirection.back) {
+      return 'Back camera: face the camera. Only one person should be visible.';
+    }
+    return 'Look at the camera. Only your face should be visible.';
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = _controller;
     final preview = _previewPath;
+    final busy = _isInitializing || _isSwitchingCamera;
 
     return Scaffold(
       appBar: AppBar(
@@ -86,8 +129,18 @@ class SelfieCaptureScreenState extends State<SelfieCaptureScreen> {
           onPressed: () => Navigator.of(context).pop<String?>(null),
         ),
         title: Text(preview == null ? 'Take selfie' : 'Review selfie'),
+        actions: [
+          if (preview == null && _canSwitchCamera)
+            IconButton(
+              tooltip: _lensDirection == CameraLensDirection.front
+                  ? 'Use back camera'
+                  : 'Use front camera',
+              onPressed: busy ? null : _toggleCamera,
+              icon: const Icon(Icons.cameraswitch),
+            ),
+        ],
       ),
-      body: _isInitializing || c == null
+      body: busy || c == null
           ? const Center(child: CircularProgressIndicator())
           : preview != null
               ? Column(
@@ -119,6 +172,31 @@ class SelfieCaptureScreenState extends State<SelfieCaptureScreen> {
                   children: [
                     Positioned.fill(child: CameraPreview(c)),
                     Positioned(
+                      top: 12,
+                      right: 12,
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.45),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 4,
+                          ),
+                          child: Text(
+                            _lensDirection == CameraLensDirection.front
+                                ? 'Front camera'
+                                : 'Back camera',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
                       left: 16,
                       right: 16,
                       bottom: 24,
@@ -131,9 +209,9 @@ class SelfieCaptureScreenState extends State<SelfieCaptureScreen> {
                               color: Colors.black.withValues(alpha: 0.55),
                               borderRadius: BorderRadius.circular(12),
                             ),
-                            child: const Text(
-                              'Look at the camera. Only your face should be visible.',
-                              style: TextStyle(color: Colors.white),
+                            child: Text(
+                              _captureHint,
+                              style: const TextStyle(color: Colors.white),
                               textAlign: TextAlign.center,
                             ),
                           ),
