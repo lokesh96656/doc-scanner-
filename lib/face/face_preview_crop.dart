@@ -4,12 +4,15 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 
-import 'face_image_utils.dart';
+import 'face_image_loader.dart';
 import 'face_quality.dart';
 
 /// Auto-crops the largest face from a combined selfie+document photo for UI preview.
 Future<File?> autoCropSelfieFacePreview(String combinedPath) async {
   try {
+    final loaded = await loadFaceAnalysisImage(combinedPath);
+    if (loaded == null) return null;
+
     final detector = FaceDetector(
       options: FaceDetectorOptions(
         performanceMode: FaceDetectorMode.accurate,
@@ -18,18 +21,16 @@ Future<File?> autoCropSelfieFacePreview(String combinedPath) async {
       ),
     );
     final faces = await detector.processImage(
-      InputImage.fromFilePath(combinedPath),
+      InputImage.fromFilePath(loaded.analysisPath),
     );
     detector.close();
     if (faces.isEmpty) return null;
 
-    final decoded = loadOrientedImage(combinedPath);
-    if (decoded == null) return null;
-
+    final image = loaded.pixels;
     final best = selectPrimaryFace(
       faces,
-      imageWidth: decoded.width,
-      imageHeight: decoded.height,
+      imageWidth: image.width,
+      imageHeight: image.height,
       minAreaRatio: 0.008,
     );
     if (best == null) return null;
@@ -42,13 +43,13 @@ Future<File?> autoCropSelfieFacePreview(String combinedPath) async {
     var right = (box.right + padX).ceil();
     var bottom = (box.bottom + padY).ceil();
 
-    left = left.clamp(0, decoded.width - 1);
-    top = top.clamp(0, decoded.height - 1);
-    right = right.clamp(left + 1, decoded.width);
-    bottom = bottom.clamp(top + 1, decoded.height);
+    left = left.clamp(0, image.width - 1);
+    top = top.clamp(0, image.height - 1);
+    right = right.clamp(left + 1, image.width);
+    bottom = bottom.clamp(top + 1, image.height);
 
     final crop = img.copyCrop(
-      decoded,
+      image,
       x: left,
       y: top,
       width: right - left,

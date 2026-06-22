@@ -4,7 +4,7 @@ import 'package:image/image.dart' as img;
 import 'package:tflite_flutter/tflite_flutter.dart';
 
 import 'face_aligner.dart';
-import 'face_image_utils.dart';
+import 'face_image_loader.dart';
 import 'face_quality.dart';
 
 /// On-device face comparison: ML Kit + 5-point alignment + MobileFaceNet embeddings.
@@ -119,24 +119,23 @@ class FaceMatchService {
     }
 
     try {
-      final idDecoded = loadOrientedImage(idImagePath);
-      final selfieDecoded = loadOrientedImage(selfieImagePath);
-      if (idDecoded == null || selfieDecoded == null) {
+      final idImage = await loadFaceAnalysisImage(idImagePath);
+      final selfieImage = await loadFaceAnalysisImage(selfieImagePath);
+      if (idImage == null || selfieImage == null) {
         return const FaceMatchResult(error: 'Could not read image files');
       }
 
-      final idFaces = await detector.processImage(
-        InputImage.fromFilePath(idImagePath),
-      );
+      final idDecoded = idImage.pixels;
+      final selfieDecoded = selfieImage.pixels;
+
+      final idFaces = await detectFaces(detector, idImage);
       if (idFaces.isEmpty) {
         return const FaceMatchResult(
           error: 'No face found on ID. Use a clearer photo of the portrait.',
         );
       }
 
-      final selfieFaces = await detector.processImage(
-        InputImage.fromFilePath(selfieImagePath),
-      );
+      final selfieFaces = await detectFaces(detector, selfieImage);
       if (selfieFaces.isEmpty) {
         return const FaceMatchResult(
           error: 'No face found in selfie. Please retake facing the camera.',
@@ -201,15 +200,10 @@ class FaceMatchService {
         return FaceMatchResult(error: selfieQuality.message);
       }
 
-      final idAligned = alignFaceTo112(idDecoded, idFace);
-      if (idAligned == null) {
-        return const FaceMatchResult(error: 'Could not align ID portrait');
-      }
-
-      final idVec = _embedWithTflite(_interpreter!, idAligned);
-      final match = _bestSelfieMatch(
+      final match = _bestFacePairMatch(
         interpreter: _interpreter!,
-        idVec: idVec,
+        idDecoded: idDecoded,
+        idFace: idFace,
         selfieDecoded: selfieDecoded,
         selfieFace: selfieFace,
       );
@@ -232,27 +226,41 @@ class FaceMatchService {
     }
   }
 
-  /// Tries normal + horizontally mirrored selfie (front camera mirror fix).
-  _EmbeddingMatch? _bestSelfieMatch({
+  /// Tries normal/mirrored alignment for ID and selfie (camera + print fixes).
+  _EmbeddingMatch? _bestFacePairMatch({
     required Interpreter interpreter,
-    required List<double> idVec,
+    required img.Image idDecoded,
+    required Face idFace,
     required img.Image selfieDecoded,
     required Face selfieFace,
   }) {
     _EmbeddingMatch? best;
 
-    void consider(img.Image? aligned) {
-      if (aligned == null) return;
-      final vec = _embedWithTflite(interpreter, aligned);
-      final distance = _euclideanDistance(idVec, vec);
-      final cosine = _cosineSimilarity(idVec, vec);
+    void consider(List<double> idVec, List<double> selfieVec) {
+      final distance = _euclideanDistance(idVec, selfieVec);
+      final cosine = _cosineSimilarity(idVec, selfieVec);
       if (best == null || cosine > best!.cosine) {
         best = _EmbeddingMatch(distance: distance, cosine: cosine);
       }
     }
 
-    consider(alignFaceTo112(selfieDecoded, selfieFace));
-    consider(alignFaceTo112Mirrored(selfieDecoded, selfieFace));
+    void tryPair(img.Image? idAligned, img.Image? selfieAligned) {
+      if (idAligned == null || selfieAligned == null) return;
+      consider(
+        _embedWithTflite(interpreter, idAligned),
+        _embedWithTflite(interpreter, selfieAligned),
+      );
+    }
+
+    final idNormal = alignFaceTo112(idDecoded, idFace);
+    final idMirrored = alignFaceTo112Mirrored(idDecoded, idFace);
+    final selfieNormal = alignFaceTo112(selfieDecoded, selfieFace);
+    final selfieMirrored = alignFaceTo112Mirrored(selfieDecoded, selfieFace);
+
+    tryPair(idNormal, selfieNormal);
+    tryPair(idNormal, selfieMirrored);
+    tryPair(idMirrored, selfieNormal);
+    tryPair(idMirrored, selfieMirrored);
 
     return best;
   }

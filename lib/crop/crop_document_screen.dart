@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -10,6 +11,7 @@ import 'package:path_provider/path_provider.dart';
 import '../document/document_corner_detector.dart';
 import '../document/image_warp.dart';
 import '../document/tilt_detection.dart';
+import '../face/face_image_utils.dart';
 import 'crop_screen_result.dart';
 import 'quad_overlay_painter.dart';
 
@@ -27,6 +29,8 @@ class CropDocumentScreenState extends State<CropDocumentScreen> {
   List<Offset>? _autoCorners01;
   Size? _viewSize;
   bool _hasUserAdjustedCorners = false;
+  img.Image? _orientedImage;
+  Uint8List? _previewBytes;
 
   static const double _handleSize = 20;
   static const double _cornerCenterInset = 26;
@@ -71,15 +75,21 @@ class CropDocumentScreenState extends State<CropDocumentScreen> {
   @override
   void initState() {
     super.initState();
-    _detectAutoCorners();
+    _loadOrientedImage();
   }
 
-  Future<void> _detectAutoCorners() async {
-    try {
-      final bytes = await File(widget.imagePath).readAsBytes();
-      final decoded = img.decodeImage(bytes);
-      if (decoded == null) return;
+  Future<void> _loadOrientedImage() async {
+    final oriented = loadOrientedImage(widget.imagePath);
+    if (oriented == null || !mounted) return;
+    setState(() {
+      _orientedImage = oriented;
+      _previewBytes = Uint8List.fromList(img.encodeJpg(oriented, quality: 90));
+    });
+    await _detectAutoCorners(oriented);
+  }
 
+  Future<void> _detectAutoCorners(img.Image decoded) async {
+    try {
       final inputImage = InputImage.fromFilePath(widget.imagePath);
       final recognizer = TextRecognizer();
       final result = await recognizer.processImage(inputImage);
@@ -158,10 +168,12 @@ class CropDocumentScreenState extends State<CropDocumentScreen> {
                 return Stack(
                   children: [
                     Positioned.fill(
-                      child: Image.file(
-                        File(widget.imagePath),
-                        fit: BoxFit.fill,
-                      ),
+                      child: _previewBytes == null
+                          ? const Center(child: CircularProgressIndicator())
+                          : Image.memory(
+                              _previewBytes!,
+                              fit: BoxFit.fill,
+                            ),
                     ),
                     Positioned.fill(
                       child: IgnorePointer(
@@ -229,9 +241,7 @@ class CropDocumentScreenState extends State<CropDocumentScreen> {
   Future<File?> _cropAndEnhance() async {
     final corners = _corners!;
     final size = _viewSize!;
-
-    final bytes = await File(widget.imagePath).readAsBytes();
-    final original = img.decodeImage(bytes);
+    final original = _orientedImage;
     if (original == null) return null;
 
     final scaleX = original.width / size.width;
@@ -266,8 +276,8 @@ class CropDocumentScreenState extends State<CropDocumentScreen> {
       work = img.copyRotate(work, angle: -tiltAngle);
     }
 
-    final gray = img.grayscale(work);
-    final enhanced = img.adjustColor(gray, contrast: 1.2);
+    // Keep color for face matching; light contrast boost for OCR readability.
+    final enhanced = img.adjustColor(work, contrast: 1.15);
 
     final dir = await getTemporaryDirectory();
     final outPath =

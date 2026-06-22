@@ -5,6 +5,7 @@ import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 
 import 'document_corner_detector.dart';
+import '../face/face_image_utils.dart';
 
 /// Automatic document crop for selfie+ID flow (no manual corner UI).
 class DocumentAutoCrop {
@@ -15,8 +16,7 @@ class DocumentAutoCrop {
     required TextRecognizer textRecognizer,
   }) async {
     try {
-      final bytes = await File(imagePath).readAsBytes();
-      final decoded = img.decodeImage(bytes);
+      final decoded = loadOrientedImage(imagePath);
       if (decoded == null) return null;
 
       RecognizedText? ocrResult;
@@ -42,8 +42,7 @@ class DocumentAutoCrop {
         height: (bottom - top).clamp(1, decoded.height),
       );
 
-      final gray = img.grayscale(cropped);
-      final enhanced = img.adjustColor(gray, contrast: 1.2);
+      final enhanced = img.adjustColor(cropped, contrast: 1.15);
 
       final dir = await getTemporaryDirectory();
       final outPath =
