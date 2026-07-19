@@ -5,41 +5,17 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 
 import 'face_aligner.dart';
 import 'face_image_loader.dart';
+import 'face_match_result.dart';
+
+export 'face_match_result.dart';
 import 'face_quality.dart';
 
 /// On-device face comparison: ML Kit + 5-point alignment + MobileFaceNet embeddings.
-class FaceMatchResult {
-  const FaceMatchResult({
-    this.matchPercent,
-    this.pass,
-    this.error,
-    this.usedEmbeddingModel = false,
-    this.distance,
-    this.cosineSimilarity,
-  });
-
-  final double? matchPercent;
-  final bool? pass;
-  final String? error;
-  final bool usedEmbeddingModel;
-
-  /// L2 distance between embeddings (lower = more similar). For debugging/tuning.
-  final double? distance;
-
-  /// Cosine similarity on L2-normalized embeddings (higher = more similar).
-  final double? cosineSimilarity;
-
-  /// Same-person if cosine similarity is at or above this (≈ distance 0.98).
-  static const double matchCosineThreshold = 0.52;
-
-  /// Cosine at or below this maps to ~0% in the UI.
-  static const double displayMinCosine = 0.38;
-
-  /// Cosine at or above this maps to ~100% in the UI.
-  static const double displayMaxCosine = 0.92;
-}
-
 class FaceMatchService {
+  static const double _matchCosineThreshold = 0.52;
+  static const double _displayMinCosine = 0.38;
+  static const double _displayMaxCosine = 0.92;
+
   FaceDetector? _detector;
   Interpreter? _interpreter;
   bool _interpreterReady = false;
@@ -211,7 +187,7 @@ class FaceMatchService {
         return const FaceMatchResult(error: 'Could not align selfie face');
       }
 
-      final pass = match.cosine >= FaceMatchResult.matchCosineThreshold;
+      final pass = match.cosine >= _matchCosineThreshold;
       final percent = _cosineToPercent(match.cosine);
 
       return FaceMatchResult(
@@ -220,6 +196,7 @@ class FaceMatchService {
         usedEmbeddingModel: true,
         distance: match.distance,
         cosineSimilarity: match.cosine,
+        provider: 'MobileFaceNet',
       );
     } catch (e) {
       return FaceMatchResult(error: 'Face match failed: $e');
@@ -266,8 +243,8 @@ class FaceMatchService {
   }
 
   double _cosineToPercent(double cosine) {
-    final low = FaceMatchResult.displayMinCosine;
-    final high = FaceMatchResult.displayMaxCosine;
+    final low = _displayMinCosine;
+    final high = _displayMaxCosine;
     if (cosine >= high) return 100;
     if (cosine <= low) return 0;
     return ((cosine - low) / (high - low) * 100).clamp(0.0, 100.0);

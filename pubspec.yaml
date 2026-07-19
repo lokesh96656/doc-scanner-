@@ -40,6 +40,7 @@ dependencies:
   path_provider: ^2.1.5
   camera: ^0.12.0+1
   tflite_flutter: ^0.11.0
+  aws_rekognition_api: ^2.0.0
 
 dev_dependencies:
   flutter_test:

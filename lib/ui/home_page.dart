@@ -10,6 +10,7 @@ import '../capture/selfie_with_document_capture_screen.dart';
 import '../crop/crop_document_screen.dart';
 import '../crop/crop_screen_result.dart';
 import '../document/document_auto_crop.dart';
+import '../face/aws_rekognition_face_service.dart';
 import '../face/face_match_service.dart';
 import '../face/face_preview_crop.dart';
 import '../ocr/json_template_engine.dart';
@@ -28,6 +29,8 @@ class HomePage extends StatefulWidget {
 class HomePageState extends State<HomePage> {
   final TextRecognizer _textRecognizer = TextRecognizer();
   final FaceMatchService _faceMatchService = FaceMatchService();
+  final AwsRekognitionFaceService _awsFaceMatchService =
+      AwsRekognitionFaceService();
   final TextEditingController _documentNumberController =
       TextEditingController();
 
@@ -45,6 +48,7 @@ class HomePageState extends State<HomePage> {
   bool? _isFaceMatchPass;
   String? _faceMatchError;
   bool _faceUsedEmbeddingModel = false;
+  String? _faceMatchProvider;
 
   ScanFlowMode? _flowMode;
 
@@ -65,6 +69,7 @@ class HomePageState extends State<HomePage> {
     _documentNumberController.dispose();
     _textRecognizer.close();
     _faceMatchService.dispose();
+    _awsFaceMatchService.dispose();
     super.dispose();
   }
 
@@ -162,6 +167,30 @@ class HomePageState extends State<HomePage> {
     );
   }
 
+  void _resetScanResults() {
+    setState(() {
+      _recognizedText = '';
+      _detectedDocumentNumber = null;
+      _matchPercent = null;
+      _isDocumentNumberMatch = null;
+      _faceMatchPercent = null;
+      _isFaceMatchPass = null;
+      _faceMatchError = null;
+      _faceUsedEmbeddingModel = false;
+      _faceMatchProvider = null;
+    });
+  }
+
+  void _applyFaceMatchResult(FaceMatchResult faceResult) {
+    setState(() {
+      _faceMatchPercent = faceResult.matchPercent;
+      _isFaceMatchPass = faceResult.pass;
+      _faceMatchError = faceResult.error;
+      _faceUsedEmbeddingModel = faceResult.usedEmbeddingModel;
+      _faceMatchProvider = faceResult.provider;
+    });
+  }
+
   Future<void> _processCapturedImages({
     required String idPath,
     required String selfiePath,
@@ -191,11 +220,50 @@ class HomePageState extends State<HomePage> {
         _recognizedText = recognizedText.text;
         _isProcessing = false;
         _processingMessage = '';
-        _faceMatchPercent = faceResult.matchPercent;
-        _isFaceMatchPass = faceResult.pass;
-        _faceMatchError = faceResult.error;
-        _faceUsedEmbeddingModel = faceResult.usedEmbeddingModel;
       });
+      _applyFaceMatchResult(faceResult);
+      _runTemplatePipeline(recognizedText.text);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isProcessing = false;
+        _processingMessage = '';
+        _recognizedText = 'Error: $e';
+      });
+    }
+  }
+
+  Future<void> _processCapturedImagesWithAws({
+    required String idPath,
+    required String selfiePath,
+  }) async {
+    setState(() {
+      _isProcessing = true;
+      _processingMessage = 'Running OCR and AWS Rekognition…';
+      _imageFile = XFile(idPath);
+      _selfieFile = XFile(selfiePath);
+    });
+
+    try {
+      final results = await Future.wait<Object?>([
+        _textRecognizer.processImage(InputImage.fromFilePath(idPath)),
+        _awsFaceMatchService.compare(
+          idImagePath: idPath,
+          selfieImagePath: selfiePath,
+        ),
+      ]);
+
+      if (!mounted) return;
+
+      final recognizedText = results[0] as RecognizedText;
+      final faceResult = results[1] as FaceMatchResult;
+
+      setState(() {
+        _recognizedText = recognizedText.text;
+        _isProcessing = false;
+        _processingMessage = '';
+      });
+      _applyFaceMatchResult(faceResult);
       _runTemplatePipeline(recognizedText.text);
     } catch (e) {
       if (!mounted) return;
@@ -219,18 +287,37 @@ class HomePageState extends State<HomePage> {
       final selfiePath = await _captureSelfiePhoto();
       if (!mounted || selfiePath == null) return;
 
-      setState(() {
-        _recognizedText = '';
-        _detectedDocumentNumber = null;
-        _matchPercent = null;
-        _isDocumentNumberMatch = null;
-        _faceMatchPercent = null;
-        _isFaceMatchPass = null;
-        _faceMatchError = null;
-        _faceUsedEmbeddingModel = false;
-      });
+      _resetScanResults();
 
       await _processCapturedImages(
+        idPath: croppedFile.path,
+        selfiePath: selfiePath,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isProcessing = false;
+        _processingMessage = '';
+        _recognizedText = 'Error: $e';
+      });
+    }
+  }
+
+  Future<void> _scanDocumentWithAws() async {
+    try {
+      _flowMode = ScanFlowMode.awsRekognition;
+      final rawPath = await _captureDocumentPhoto();
+      if (!mounted || rawPath == null) return;
+
+      final croppedFile = await _cropDocumentPhoto(rawPath);
+      if (!mounted || croppedFile == null) return;
+
+      final selfiePath = await _captureSelfiePhoto();
+      if (!mounted || selfiePath == null) return;
+
+      _resetScanResults();
+
+      await _processCapturedImagesWithAws(
         idPath: croppedFile.path,
         selfiePath: selfiePath,
       );
@@ -271,16 +358,7 @@ class HomePageState extends State<HomePage> {
         return;
       }
 
-      setState(() {
-        _recognizedText = '';
-        _detectedDocumentNumber = null;
-        _matchPercent = null;
-        _isDocumentNumberMatch = null;
-        _faceMatchPercent = null;
-        _isFaceMatchPass = null;
-        _faceMatchError = null;
-        _faceUsedEmbeddingModel = false;
-      });
+      _resetScanResults();
 
       await _processSelfieWithDocument(
         combinedPath: combinedPath,
@@ -328,11 +406,8 @@ class HomePageState extends State<HomePage> {
         _recognizedText = recognizedText.text;
         _isProcessing = false;
         _processingMessage = '';
-        _faceMatchPercent = faceResult.matchPercent;
-        _isFaceMatchPass = faceResult.pass;
-        _faceMatchError = faceResult.error;
-        _faceUsedEmbeddingModel = faceResult.usedEmbeddingModel;
       });
+      _applyFaceMatchResult(faceResult);
       _runTemplatePipeline(recognizedText.text);
     } catch (e) {
       if (!mounted) return;
@@ -342,6 +417,22 @@ class HomePageState extends State<HomePage> {
         _recognizedText = 'Error: $e';
       });
     }
+  }
+
+  Future<void> _reprocessCurrentScan() async {
+    final idPath = _imageFile?.path;
+    final selfiePath = _selfieFile?.path;
+    if (idPath == null || selfiePath == null) return;
+
+    if (_flowMode == ScanFlowMode.awsRekognition) {
+      await _processCapturedImagesWithAws(
+        idPath: idPath,
+        selfiePath: selfiePath,
+      );
+      return;
+    }
+
+    await _processCapturedImages(idPath: idPath, selfiePath: selfiePath);
   }
 
   Future<void> _changeDocument() async {
@@ -383,10 +474,8 @@ class HomePageState extends State<HomePage> {
 
     final selfiePath = _selfieFile?.path;
     if (selfiePath != null) {
-      await _processCapturedImages(
-        idPath: croppedFile.path,
-        selfiePath: selfiePath,
-      );
+      setState(() => _imageFile = XFile(croppedFile.path));
+      await _reprocessCurrentScan();
     } else {
       setState(() => _imageFile = XFile(croppedFile.path));
     }
@@ -408,6 +497,14 @@ class HomePageState extends State<HomePage> {
 
     final selfiePath = await _captureSelfiePhoto();
     if (!mounted || selfiePath == null) return;
+
+    if (_flowMode == ScanFlowMode.awsRekognition) {
+      await _processCapturedImagesWithAws(
+        idPath: idPath,
+        selfiePath: selfiePath,
+      );
+      return;
+    }
 
     await _processCapturedImages(idPath: idPath, selfiePath: selfiePath);
   }
@@ -461,6 +558,12 @@ class HomePageState extends State<HomePage> {
                     ),
                   ),
                 ],
+              ),
+              const SizedBox(height: 8),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.cloud_outlined),
+                label: const Text('Scan ID (AWS Rekognition)'),
+                onPressed: _isProcessing ? null : _scanDocumentWithAws,
               ),
               const SizedBox(height: 16),
               if (_isProcessing) ...[
@@ -625,9 +728,7 @@ class HomePageState extends State<HomePage> {
                         ),
                       ),
                       Text(
-                        _faceUsedEmbeddingModel
-                            ? 'Model: MobileFaceNet'
-                            : 'Model: Not loaded',
+                        'Model: ${_faceMatchProvider ?? (_faceUsedEmbeddingModel ? 'MobileFaceNet' : 'Not loaded')}',
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ],

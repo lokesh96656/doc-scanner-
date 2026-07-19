@@ -9,5 +9,6 @@ void main() {
     expect(find.text('OCR Document Scanner'), findsOneWidget);
     expect(find.text('Scan ID'), findsOneWidget);
     expect(find.text('Selfie + ID'), findsOneWidget);
+    expect(find.text('Scan ID (AWS Rekognition)'), findsOneWidget);
   });
 }
