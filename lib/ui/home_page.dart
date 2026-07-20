@@ -727,10 +727,11 @@ class HomePageState extends State<HomePage> {
                           color: _isFaceMatchPass! ? Colors.green : Colors.red,
                         ),
                       ),
-                      Text(
-                        'Model: ${_faceMatchProvider ?? (_faceUsedEmbeddingModel ? 'MobileFaceNet' : 'Not loaded')}',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
+                      // Hidden from end users — keep for debugging if needed later:
+                      // Text(
+                      //   'Model: ${_faceMatchProvider ?? (_faceUsedEmbeddingModel ? 'MobileFaceNet' : 'Not loaded')}',
+                      //   style: Theme.of(context).textTheme.bodySmall,
+                      // ),
                     ],
                   ),
                 ),

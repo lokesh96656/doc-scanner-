@@ -12,9 +12,8 @@ import 'face_quality.dart';
 
 /// On-device face comparison: ML Kit + 5-point alignment + MobileFaceNet embeddings.
 class FaceMatchService {
+  /// Same-person decision threshold (raw cosine on L2-normalized embeddings).
   static const double _matchCosineThreshold = 0.52;
-  static const double _displayMinCosine = 0.38;
-  static const double _displayMaxCosine = 0.92;
 
   FaceDetector? _detector;
   Interpreter? _interpreter;
@@ -242,21 +241,39 @@ class FaceMatchService {
     return best;
   }
 
+  /// Maps cosine → UI % so same-person pairs (often 0.70–0.90) land near AWS-like
+  /// high scores, while different people stay low.
+  ///
+  /// Previous linear map (0.38→0%, 0.92→100%) crushed a solid ~0.79 cosine to ~76%.
   double _cosineToPercent(double cosine) {
-    final low = _displayMinCosine;
-    final high = _displayMaxCosine;
-    if (cosine >= high) return 100;
-    if (cosine <= low) return 0;
-    return ((cosine - low) / (high - low) * 100).clamp(0.0, 100.0);
+    if (cosine >= 0.85) return 100;
+    if (cosine >= 0.75) {
+      // Strong same-person (selfie↔selfie / clear ID): 92–100%
+      return 92 + (cosine - 0.75) / 0.10 * 8;
+    }
+    if (cosine >= _matchCosineThreshold) {
+      // Pass band: 80–92%
+      return 80 +
+          (cosine - _matchCosineThreshold) /
+              (0.75 - _matchCosineThreshold) *
+              12;
+    }
+    if (cosine >= 0.38) {
+      // Below pass: 0–79%
+      return (cosine - 0.38) / (_matchCosineThreshold - 0.38) * 79;
+    }
+    return 0;
   }
 
   List<double> _embedWithTflite(Interpreter interpreter, img.Image face112) {
+    // Light normalize brightness so lighting / mono vs color gaps hurt less.
+    final prepared = _normalizeFaceLighting(face112);
     final input = List.generate(
       1,
       (_) => List.generate(
         _inputSize,
         (y) => List.generate(_inputSize, (x) {
-          final p = face112.getPixel(x, y);
+          final p = prepared.getPixel(x, y);
           return [
             (p.r.toDouble() - 127.5) / 128.0,
             (p.g.toDouble() - 127.5) / 128.0,
@@ -270,6 +287,40 @@ class FaceMatchService {
     final output = [List<double>.filled(outLen, 0)];
     interpreter.run(input, output);
     return _l2Normalize(List<double>.from(output[0]));
+  }
+
+  /// Scales RGB toward mid brightness without destroying color (helps mono/color pairs).
+  img.Image _normalizeFaceLighting(img.Image src) {
+    var sum = 0.0;
+    var count = 0;
+    for (var y = 0; y < src.height; y += 2) {
+      for (var x = 0; x < src.width; x += 2) {
+        final p = src.getPixel(x, y);
+        sum += (p.r + p.g + p.b) / 3.0;
+        count++;
+      }
+    }
+    if (count == 0) return src;
+    final mean = sum / count;
+    if (mean < 1) return src;
+    final scale = (127.5 / mean).clamp(0.75, 1.35);
+    if ((scale - 1.0).abs() < 0.05) return src;
+
+    final out = img.Image(width: src.width, height: src.height);
+    for (var y = 0; y < src.height; y++) {
+      for (var x = 0; x < src.width; x++) {
+        final p = src.getPixel(x, y);
+        out.setPixelRgba(
+          x,
+          y,
+          (p.r * scale).round().clamp(0, 255),
+          (p.g * scale).round().clamp(0, 255),
+          (p.b * scale).round().clamp(0, 255),
+          p.a.toInt(),
+        );
+      }
+    }
+    return out;
   }
 
   List<double> _l2Normalize(List<double> v) {

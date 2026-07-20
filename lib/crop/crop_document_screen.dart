@@ -276,14 +276,12 @@ class CropDocumentScreenState extends State<CropDocumentScreen> {
       work = img.copyRotate(work, angle: -tiltAngle);
     }
 
-    // Keep color for face matching; light contrast boost for OCR readability.
-    final enhanced = img.adjustColor(work, contrast: 1.15);
-
+    // Keep original color for face matching — contrast boost hurts embeddings.
     final dir = await getTemporaryDirectory();
     final outPath =
         '${dir.path}/scan_${DateTime.now().millisecondsSinceEpoch}.jpg';
     final outFile = File(outPath);
-    await outFile.writeAsBytes(img.encodeJpg(enhanced, quality: 90));
+    await outFile.writeAsBytes(img.encodeJpg(work, quality: 92));
     return outFile;
   }
 }

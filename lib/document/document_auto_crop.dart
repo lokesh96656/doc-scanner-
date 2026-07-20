@@ -42,13 +42,11 @@ class DocumentAutoCrop {
         height: (bottom - top).clamp(1, decoded.height),
       );
 
-      final enhanced = img.adjustColor(cropped, contrast: 1.15);
-
       final dir = await getTemporaryDirectory();
       final outPath =
           '${dir.path}/doc_auto_${DateTime.now().millisecondsSinceEpoch}.jpg';
       final outFile = File(outPath);
-      await outFile.writeAsBytes(img.encodeJpg(enhanced, quality: 90));
+      await outFile.writeAsBytes(img.encodeJpg(cropped, quality: 92));
       return outFile;
     } catch (_) {
       return null;
